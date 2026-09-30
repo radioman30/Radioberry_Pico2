@@ -54,9 +54,9 @@ Radioberry e pe 3,3 V, ca Pi-ul), deci nu trebuie translatoare.
 
 | Funcție | Pico GP | Pico pin fizic | Legătură |
 |---|---|---|---|
-| I2S DATA | GP6 | 9 | PCM5102A DIN |
-| I2S BCK | GP7 | 10 | PCM5102A BCK |
-| I2S LRCK | GP8 | 11 | PCM5102A LRCK |
+| I2S DATA | GP6 | 9 | ~~PCM5102A DIN~~ → Teensy RX1, vezi §0.4 |
+| I2S BCK | GP7 | 10 | ~~PCM5102A BCK~~ → Teensy BCLK (intrare), §0.4 |
+| I2S LRCK | GP8 | 11 | ~~PCM5102A LRCK~~ → Teensy LRCLK (intrare), §0.4 |
 | OLED SDA (I2C1) | GP14 | 19 | SH1106 SDA |
 | OLED SCL (I2C1) | GP15 | 20 | SH1106 SCL |
 | Encoder A | GP10 | 14 | encoder CLK/A |
@@ -69,6 +69,30 @@ Radioberry e pe 3,3 V, ca Pi-ul), deci nu trebuie translatoare.
 Encoderul și butoanele: pull-up intern în Pico, **contactul spre GND** (comunul encoderului la
 GND, nu la 3V3). Strapurile PCM5102A rămân cele din §1.2 (SCK→GND, XSMT→3V3 etc.).
 OLED-ul SH1106 la adresa 0x3C; offset-ul de 2 coloane îl tratează biblioteca U8g2.
+
+### 0.4 Placa de sunet — Pico 2 ↔ Teensy 3.6 + Audio Shield (înlocuiește PCM5102A)
+
+Decizie din 1 oct 2026 (README §3.1). Fostele pini PCM5102A (GP6–8) își schimbă rolul:
+Teensy e master I2S, Pico e slave.
+
+| Funcție | Pico GP | Pico pin fizic | Teensy 3.6 pin | Direcție |
+|---|---|---|---|---|
+| I2S BCLK | GP7 | 10 | 9 (BCLK, comun cu shield-ul) | Teensy → Pico |
+| I2S LRCLK | GP8 | 11 | 23 (LRCLK, comun cu shield-ul) | Teensy → Pico |
+| I2S date audio | GP6 | 9 | 38 (RX1, `AudioInputI2SQuad`) | Pico → Teensy |
+| I2S microfon *(TX, mai târziu)* | — (fără pin liber pe Pico 2) | — | 15 (TX1, `AudioOutputI2SQuad`) | Teensy → Pico |
+| I2C SDA (comenzi) | GP14 | 19 | 4 (SDA2, `Wire2` slave) | bus comun cu OLED |
+| I2C SCL (comenzi) | GP15 | 20 | 3 (SCL2, `Wire2` slave) | bus comun cu OLED |
+| GND | GND | 38 | GND | — |
+
+- Toate semnalele sunt 3,3 V; **Teensy 3.6 nu tolerează 5 V** pe pini.
+- Pull-up-urile I2C sunt deja pe modulul OLED (4k7); nu pune altele pe Teensy.
+- BCLK e ~2,8 MHz: fire scurte (sub 15 cm), cu un fir de GND lângă ele.
+- Pe Teensy nu se mai leagă display, encoder sau butoane; pinii 3/4 (foști BTN_NR / ENC_A în
+  Teensy36_DSPFilter) devin I2C-ul de comandă.
+- ⚠️ Numerotarea pinilor Teensy 3.6 pentru RX1 (38), TX1 (15) și Wire2 (3/4) e din memorie —
+  **de verificat pe cartela de pinout PJRC** înainte de lipit.
+- Alimentare: Teensy din aceeași sursă de 5 V (VIN), masă comună într-un singur punct.
 
 ### 0.3 RP2350-PiZero (build final)
 

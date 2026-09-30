@@ -22,7 +22,7 @@ paralele citite de PIO. Faza 0 anterioara: Nimic nu e validat inca pe bancul pro
 | Host — bring-up | Raspberry Pi Pico 2 (RP2350) | 2x M33 @150 MHz, FPU + DSP, 520 KB SRAM |
 | Host — build final | Waveshare **RP2350-PiZero** | RP2350B, 48 GPIO, 16 MB flash, header 40 pini **format Pi** — Radioberry se infige direct. Vezi `WIRING.md` §8 |
 | Frontend + DDC | Radioberry v2 | Cyclone 10 LP **10CL025** + AD9866, clock 73.728 MHz |
-| Audio out | PCM5102A | I2S prin PIO |
+| Audio out | ~~PCM5102A~~ → **Teensy 3.6 + Audio Shield rev B** ca placă de sunet | I2S (Teensy master) + comenzi I2C — vezi §3.1 |
 | UI | OLED 1.3" SH1106 I2C + encoder + 2 butoane | carcasa exista deja printata |
 | Alimentare | PSU 5 V / 2 A extern | vezi `WIRING.md` §2 |
 
@@ -105,27 +105,58 @@ Celelalte moduri, din acelasi IQ:
 
 ---
 
-## 3.1 Lantul audio — Teensy 3.6 ca etaj DSP extern (decis 1 oct 2026)
+## 3.1 Placa de sunet — Teensy 3.6 + Audio Shield rev B (decis 1 oct 2026)
 
-Audio-ul demodulat iese din Pico pe PCM5102A si intra **analogic** in proiectul
-[Teensy36_DSPFilter](../Teensy36_DSPFilter) (Teensy 3.6 + Audio Shield rev B, SGTL5000):
+**PCM5102A iese din proiect.** Teensy 3.6 cu Audio Shield-ul (SGTL5000) devine placa de sunet a
+lui Pico: **fără display, encoder sau butoane pe Teensy** — toată interfața rămâne pe Pico, care
+comandă Teensy-ul pe I2C. Teensy face doar DSP audio (FIR, biquad CW, NR, auto-notch — din
+proiectul [Teensy36_DSPFilter](../Teensy36_DSPFilter)) și ieșirea pe căști.
 
 ```
-Radioberry -> Pico 2 (demodulare, AGC) -> PCM5102A LINE OUT -> atenuator ~6 dB
-           -> Audio Shield LINE IN -> FIR / biquad CW / NR / auto-notch -> casti (Audio Shield)
+Radioberry --IQ--> Pico 2 (demodulare, AGC, resampling 48 k -> 44,1 k)
+                     |  I2S date audio (Pico slave)          ^ I2C comenzi (Pico master)
+                     v                                       |
+                   Teensy 3.6 (I2S master) -> DSP -> SGTL5000 -> căști
+                     |  (mai târziu) microfon SGTL5000 -> I2S -> Pico -> TX Radioberry
 ```
 
-- **De ce analogic, nu I2S/IQ digital:** Pico ramane singurul care vorbeste cu FPGA-ul; nu apar
-  doua domenii de ceas (48 kHz din FPGA vs 44,1 kHz Teensy) si nici limita de 16 biti a bibliotecii
-  audio Teensy pe IQ. Cele doua proiecte raman independente — Teensy-ul merge si pe alt
-  transceiver, Pico-ul merge si fara Teensy (casti direct pe PCM5102A).
-- **Nivel (capcana):** PCM5102A scoate 2,1 Vrms (~5,9 Vpp) la full-scale; LINE IN pe SGTL5000
-  accepta ~3,1 Vpp la gain minim (`lineIn = 0`). Deci **-6 dB**: divizor rezistiv 10k/10k pe
-  fiecare canal SAU volumul digital al Pico plafonat la 50 %. Fara asta, distorsiune.
-- **Masa:** aceeasi sursa de 5 V pentru ambele, masa comuna printr-un singur punct (fara bucle).
-- **Mono:** Pico trimite aceeasi demodulare pe L si R; Teensy-ul lucreaza oricum pe un canal.
-- **TX (mai tarziu):** Audio Shield-ul are si intrare de microfon, dar e legat de Teensy; pentru
-  TX pe Radioberry calea audio ar trebui sa ajunga in Pico — de decis cand ajungem acolo.
+**Două legături, fiecare cu rolul ei:**
+
+| Legătură | Ce duce | Cine e master | Pini Pico |
+|---|---|---|---|
+| **I2S** | audio demodulat Pico → Teensy; mai târziu microfon Teensy → Pico | **Teensy** (generează BCLK/LRCLK, oricum le face pentru SGTL5000) | 3 (fostele pini PCM5102A) + 1 pentru microfon |
+| **I2C** | comenzi: volum, mod, filtru, NR, notch, sursă; citire nivel/clip | **Pico** | 0 noi — același bus I2C1 cu OLED-ul |
+
+I2C nu poate duce sunetul (0,4 Mbit/s față de ~1,5 Mbit/s necesari) — de-asta sunt două legături.
+
+**Detalii de proiectare:**
+- **Ceasuri:** FPGA-ul dă 48 kHz (din cuarțul Radioberry), Teensy lucrează la 44 117,6 Hz pe
+  ceasul lui. Pico e slave I2S și face **conversie asincronă de rată** 48 k → ~44,1 k, cu rata
+  corectată continuu după gradul de umplere al bufferului (buclă PI). Pe audio demodulat după
+  AGC, 16 biți ajung.
+- **Teensy primește pe a doua linie I2S** (`AudioInputI2SQuad`: canalele 1–2 = ADC-ul
+  SGTL5000, canalele 3–4 = Pico pe RX1). Microfonul spre Pico ar ieși pe TX1
+  (`AudioOutputI2SQuad`).
+- **I2C pe Teensy:** SGTL5000 e comandat de Teensy pe `Wire` (18/19, Teensy master). Comenzile de
+  la Pico vin pe **`Wire2` (pinii 3/4), Teensy slave**, ca să nu se amestece cele două roluri.
+  Adresa propusă: **0x42** (OLED-ul e la 0x3C).
+- **Firmware Teensy separat** („sound card"), care refolosește blocurile DSP din Teensy36_DSPFilter;
+  proiectul cu display rămâne neatins și merge în continuare singur pe alt transceiver.
+- **Dezavantaj asumat:** fără Teensy, Pico nu mai scoate sunet. Pe RP2350-PiZero se poate păstra
+  o ieșire PWM de rezervă pe un pin liber.
+
+**Registre I2C propuse (Teensy, adresa 0x42)** — de fixat când se scrie firmware-ul:
+
+| Reg | Mărime | Sens |
+|---|---|---|
+| 0x00 | u8 | volum căști 0–100 |
+| 0x01 | u8 | mod: 0 bypass, 1 SSB, 2 CW, 3 AM |
+| 0x02 | u16 | filtru: marginea de jos, Hz |
+| 0x04 | u16 | filtru: marginea de sus, Hz |
+| 0x06 | u8 | reducere zgomot 0–10 |
+| 0x07 | u8 | auto-notch 0/1 |
+| 0x08 | u8 | sursă: 0 = I2S de la Pico, 1 = line-in (test) |
+| 0x10 | u8 (citire) | nivel de vârf / flag de clip |
 
 ## 4. Plan pe faze
 
