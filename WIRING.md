@@ -20,6 +20,10 @@ Pinii sunt notati `GPn` (numar GPIO) / `#nn` (numar fizic pe header).
 
 ### 1.1 SPI0 — link catre FPGA  *(critic, cu DMA)*
 
+> ⚠️ **DEPASIT (30 sep 2026):** SPI e doar pentru comenzi; IQ-ul vine pe 4 linii paralele +
+> RDY + CLK prin PIO, iar gateware-ul se incarca de catre host. Vezi `PROTOCOL.md` §1–3;
+> harta de pini de mai jos trebuie refacuta.
+
 | GP | # | Semnal Pico | Radioberry (Pi 40-pin) | Pi phys |
 |----|----|-------------|------------------------|---------|
 | GP16 | 21 | SPI0 RX (MISO) | GPIO9  / MISO | 21 |

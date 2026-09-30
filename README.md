@@ -8,7 +8,9 @@ grea (DDC, decimare); Pi-ul nu facea decat sa citeasca IQ pe SPI si sa-l impache
 in UDP HPSDR pentru un PC. Partea aia o poate face un RP2350, iar restul
 demodularii incape lejer in cele doua nuclee M33.
 
-**Stare:** faza 0 — recunoastere. Nimic nu e validat inca pe bancul propriu, dar
+**Stare (30 sep 2026):** interfata host<->FPGA extrasa din driverul PA3GSB pentru Pi 5 (pio-mode) —
+vezi **[`PROTOCOL.md`](PROTOCOL.md)**. IQ-ul NU vine pe SPI (cum presupunea planul), ci pe 4 linii
+paralele citite de PIO. Faza 0 anterioara: Nimic nu e validat inca pe bancul propriu, dar
 **arhitectura e confirmata de un tert care a ajuns deja la ea** — vezi §6.1.
 
 ---

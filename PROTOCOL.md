@@ -1,0 +1,106 @@
+# PROTOCOL.md — interfața host ↔ FPGA Radioberry v2
+
+**Sursa:** driverul PA3GSB pentru Raspberry Pi 5, modul „pio-mode” (decembrie 2025):
+`pa3gsb/Radioberry-2.x` → `SBC/rpi-5/device_driver/pio-mode/driver/`
+(`rb2-rx-stream.c`, `rb2-tx-stream.c`, `rb2-trx-control.[ch]`, `rb2-load-fpga.[ch]`).
+
+Pi 5 face I/O-ul prin cipul **RP1, care are PIO de aceeași arhitectură ca RP2040/RP2350**.
+Programele PIO de mai jos sunt deci portabile aproape 1:1 pe Pico 2.
+
+> Corecție față de planul inițial (README §6, WIRING §1.1): fluxul IQ **nu vine pe SPI**.
+> SPI e doar pentru comenzi. IQ-ul RX vine pe 4 linii de date paralele + ready + clock,
+> citite de un state machine PIO cu DMA. Stare: **extras din cod, nevalidat pe bancul propriu.**
+
+Numerele de pini sunt **GPIO BCM de pe header-ul Pi** (adică pinii pe care îi vede Radioberry).
+
+---
+
+## 1. Încărcarea gateware-ului (passive serial, la fiecare pornire)
+
+FPGA-ul Cyclone 10 LP nu are configurație proprie la pornire — o încarcă host-ul.
+
+| Semnal | GPIO | Dir. (host) |
+|---|---|---|
+| nCONFIG | 27 | ieșire |
+| DATA0 | 13 | ieșire |
+| DCLK | 24 | ieșire |
+| nSTATUS | 26 | intrare |
+| CONF_DONE | 22 | intrare |
+
+Secvența (`rb2-load-fpga.c`):
+1. nCONFIG=0, DATA=0, DCLK=0; așteaptă 1 s; nCONFIG=1.
+2. Așteaptă nSTATUS=1 (timeout ~2 s → eroare).
+3. Pentru fiecare octet din `.rbf`: 8 biți **LSB primul** — pune DATA, ~1 µs, puls DCLK.
+4. Verifică nSTATUS=1 și CONF_DONE=1.
+5. Încă 2 pulsuri DCLK (inițializare).
+
+Pe Pico: `.rbf`-ul pentru **CL025** stă în flash (se livrează în `SBC/.../releases/.../CL025`).
+Bit-bang-ul se poate face și cu PIO (mult mai rapid decât 1 µs/bit).
+
+## 2. Control (SPI)
+
+| Semnal | GPIO |
+|---|---|
+| CE0 | 8 |
+| CE1 | 7 |
+| SCLK | 11 |
+| MISO | 9 |
+| MOSI | 10 |
+
+Transfer full-duplex simplu (`rb2_trx_control(tx, rx, cnt)` = un `spi_sync`). Formatul mesajelor
+(frecvență, câștig, filtre etc.) e în codul de firmware al driverului — **de extras** (pasul următor).
+
+## 3. RX — flux IQ (PIO + DMA)
+
+| Semnal | GPIO | Dir. (host) |
+|---|---|---|
+| RX_CLK | 6 | ieșire (side-set) |
+| RX_RDY (sample ready) | 25 | intrare (`jmp pin`) |
+| D0..D3 | 18, 19, 20, 21 | intrări (`in pins, 4`) |
+
+Program PIO (18 instrucțiuni, din `rb2-rx-stream.c`):
+
+```
+.side_set 1 opt
+.wrap_target
+    jmp 15
+L1: nop        side 1 [3]
+    in  pins,4 side 0          ; ×7 perechi → 7 nibble-uri
+    ...                        ; (instr. 1..14)
+    nop        side 1 [2]      ; 15
+    nop        side 0 [2]      ; 16
+    jmp pin L1                 ; 17: dacă RDY=1 → citește un cuvânt
+.wrap
+```
+
+Configurația state machine-ului, decodată din registre:
+
+| Registru | Valoare | Înseamnă |
+|---|---|---|
+| CLKDIV | 0x00020000 | divizor întreg 2 |
+| EXECCTRL | 0x5901f600 (+wrap) | JMP_PIN = 25 (RDY), side-set opțional activ |
+| SHIFTCTRL | 0x01c10000 | autopush, prag **28 biți**, shift spre stânga |
+| PINCTRL | 0x40091800 | IN_BASE = 18, SIDESET_BASE = 6, side-set 2 biți (1 + bitul „opt”) |
+
+Deci: la fiecare RDY=1 host-ul generează 7 fronturi de ceas și citește 7 × 4 = **28 de biți**,
+împinși automat în FIFO → DMA. De lămurit din gateware: cum se împart cei 28 de biți
+(eșantion 24 biți + 4 biți de marcaj/canal?) și câte cuvinte formează o pereche I/Q.
+
+## 4. TX (în afara scopului v1, notat pentru completitudine)
+
+| Semnal | GPIO | Dir. (host) |
+|---|---|---|
+| TX_RDY | 12 | intrare |
+| TX_DATA | 5 | ieșire |
+| TX_CLK | 4 | ieșire |
+
+## 5. Consecințe pentru Radioberry_Pico2
+
+- **Faza 0 (analizor logic pe Pi) nu mai e necesară pentru pini și forma semnalelor** — sunt
+  în codul de mai sus. Rămâne de verificat pe banc formatul cuvântului de 28 biți.
+- **Bugetul de pini (doar RX):** gateware 5 + SPI 5 (4 dacă CE1 nu trebuie) + RX 6 = 16,
+  plus I2S 3 + OLED 2 + encoder/butoane 5 = **26 = exact câți GPIO are Pico 2**.
+  Fără rezervă; debug doar pe USB. Argument puternic pentru **Waveshare RP2350-PiZero**
+  (RP2350B, 48 GPIO, header Pi): Radioberry se infige direct și pinii BCM de mai sus
+  se pot folosi ca atare, PIO-ul nu ține de pini ficși.
+- WIRING.md §1.1 (IQ pe SPI0) e **depășit** — de refăcut după tabelele de aici.
