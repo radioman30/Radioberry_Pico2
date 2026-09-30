@@ -18,3 +18,4 @@ __pycache__/
 
 # gateware Radioberry (binar tert, nu se publica)
 firmware/rb_bringup/gateware_*.h
+gateware/
