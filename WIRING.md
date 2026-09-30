@@ -72,6 +72,31 @@ OLED-ul SH1106 la adresa 0x3C; offset-ul de 2 coloane îl tratează biblioteca U
 
 ### 0.3 RP2350-PiZero (build final)
 
+**Mapare header → GPIO confirmată parțial (1 oct 2026)** din `board_pins.h` al lui PA3GSB,
+proiectul `RP2350-SDR-CW-Interface` (rulează pe aceeași placă, cu un HAT audio WM8960):
+
+| Pin fizic header | GPIO Pi (BCM) | GPIO RP2350-PiZero | Folosit la Radioberry |
+|---|---|---|---|
+| 12 / 35 / 38 / 40 | 18 / 19 / 20 / 21 | 18 / 19 / 20 / 21 (1:1) | RX D0–D3 |
+| 31 | 6 | 6 (1:1) | RX CLK |
+| 13 / 15 / 18 / 33 | 27 / 22 / 24 / 13 | 27 / 22 / 24 / 13 (1:1) | FPGA nCONFIG / CONF_DONE / DCLK / DATA0 |
+| 24 / 26 | 8 / 7 | 8 / 7 (1:1) | SPI CE0 / CE1 |
+| **19 / 21 / 23** | 10 / 9 / 11 | **11 / 12 / 10** | SPI MOSI / MISO / SCLK → **SPI1 hardware** (SCK 10, TX 11, RX 12) |
+| 16 | 23 | 23 (1:1) | — |
+| 3 / 5 | 2 / 3 | 2 / 3 (1:1) | I2C |
+| 29 | 5 | **15** | (TX data la Pi 5: BCM5) |
+| 22 | 25 | ? — probabil 25 | RX RDY |
+| 37 | 26 | ? — probabil 26 | FPGA nSTATUS |
+
+⚠️ În fișierul PA3GSB apare „J5 pin 20 → GPIO25”, dar pe header-ul Pi pinul 20 e GND —
+probabil greșeală de tipar pentru pinul 22. **De verificat pe schema Waveshare** pinii 20, 22, 37.
+
+Consecințe pentru firmware pe PiZero: SPI pe `spi1` (10/11/12, CS manual pe 8), RX PIO cu
+IN_BASE 18 și side-set pe 6, jmp pin pe RDY. UI-ul (OLED, encoder, butoane) trebuie pus pe
+pinii de header lăsați liberi de Radioberry — PA3GSB își pune encoderul pe GP15/6/13, dar 6 și 13
+sunt ocupați aici.
+
+
 Pe Waveshare RP2350-PiZero, Radioberry se infige direct în header, deci se folosesc chiar
 GPIO-urile BCM din coloana a patra, dacă maparea header → GPIO a plăcii e 1:1 (de verificat pe
 schema Waveshare). Programul PIO nu depinde de pini ficși, doar D0–D3 trebuie consecutivi
