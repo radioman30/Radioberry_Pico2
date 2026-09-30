@@ -77,7 +77,7 @@ Dificultatea reala nu e in DSP, ci in §6.
   |    v                                                           |
   |  AGC (attack rapid, decay lent)                                |
   |    v                                                           |
-  |  I2S out (PIO) --> PCM5102A --> casti                          |
+  |  I2S slave (PIO) --> Teensy 3.6 + shield --> casti (§3.1)    |
   +----------------------------------------------------------------+
 ```
 
