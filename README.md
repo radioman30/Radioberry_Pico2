@@ -105,6 +105,28 @@ Celelalte moduri, din acelasi IQ:
 
 ---
 
+## 3.1 Lantul audio — Teensy 3.6 ca etaj DSP extern (decis 1 oct 2026)
+
+Audio-ul demodulat iese din Pico pe PCM5102A si intra **analogic** in proiectul
+[Teensy36_DSPFilter](../Teensy36_DSPFilter) (Teensy 3.6 + Audio Shield rev B, SGTL5000):
+
+```
+Radioberry -> Pico 2 (demodulare, AGC) -> PCM5102A LINE OUT -> atenuator ~6 dB
+           -> Audio Shield LINE IN -> FIR / biquad CW / NR / auto-notch -> casti (Audio Shield)
+```
+
+- **De ce analogic, nu I2S/IQ digital:** Pico ramane singurul care vorbeste cu FPGA-ul; nu apar
+  doua domenii de ceas (48 kHz din FPGA vs 44,1 kHz Teensy) si nici limita de 16 biti a bibliotecii
+  audio Teensy pe IQ. Cele doua proiecte raman independente — Teensy-ul merge si pe alt
+  transceiver, Pico-ul merge si fara Teensy (casti direct pe PCM5102A).
+- **Nivel (capcana):** PCM5102A scoate 2,1 Vrms (~5,9 Vpp) la full-scale; LINE IN pe SGTL5000
+  accepta ~3,1 Vpp la gain minim (`lineIn = 0`). Deci **-6 dB**: divizor rezistiv 10k/10k pe
+  fiecare canal SAU volumul digital al Pico plafonat la 50 %. Fara asta, distorsiune.
+- **Masa:** aceeasi sursa de 5 V pentru ambele, masa comuna printr-un singur punct (fara bucle).
+- **Mono:** Pico trimite aceeasi demodulare pe L si R; Teensy-ul lucreaza oricum pe un canal.
+- **TX (mai tarziu):** Audio Shield-ul are si intrare de microfon, dar e legat de Teensy; pentru
+  TX pe Radioberry calea audio ar trebui sa ajunga in Pico — de decis cand ajungem acolo.
+
 ## 4. Plan pe faze
 
 Fazele 1b si 1 sunt independente — se pot face in paralel.
