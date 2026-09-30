@@ -10,11 +10,76 @@ rezolva in favoarea fisierului, dupa verificare pe placa.
 | Frontend | Radioberry v2 — Cyclone 10 LP **10CL025** + AD9866, clock 73.728 MHz |
 | Audio out | PCM5102A (modul I2S) |
 | UI | OLED 1.3" I2C (SH1106) + encoder rotativ + 2 butoane |
-| Stare | **NEVALIDAT** — alocare propusa, vezi §7 |
+| Stare | **NEVALIDAT pe placă** — harta v2 in §0 (1 oct 2026), extrasa din driverul PA3GSB |
 
 ---
 
-## 1. Harta de pini — Pico 2
+## 0. Harta de pini v2 — Pico 2 ↔ Radioberry (1 oct 2026)  ← SURSA DE ADEVĂR
+
+Refăcută după protocolul real (`PROTOCOL.md`): IQ-ul vine pe 4 linii paralele citite de PIO,
+SPI e doar pentru comenzi, iar host-ul încarcă gateware-ul FPGA. Codul folosește exact
+această hartă: `firmware/rb_bringup/pins.h`. **§1 de mai jos e versiunea veche, depășită.**
+
+Toți cei 26 de GPIO ai Pico 2 sunt ocupați. Consola e pe USB, nu pe UART.
+
+### 0.1 Pico 2 → header-ul Radioberry (40 pini, format Pi)
+
+| Funcție | Pico GP | Pico pin fizic | Radioberry GPIO (BCM) | Header Pi pin fizic |
+|---|---|---|---|---|
+| FPGA nCONFIG | GP0 | 1 | 27 | 13 |
+| FPGA DATA0 | GP1 | 2 | 13 | 33 |
+| FPGA DCLK | GP22 | 29 | 24 | 18 |
+| FPGA nSTATUS | GP26 | 31 | 26 | 37 |
+| FPGA CONF_DONE | GP27 | 32 | 22 | 15 |
+| RX D0 | GP2 | 4 | 18 | 12 |
+| RX D1 | GP3 | 5 | 19 | 35 |
+| RX D2 | GP4 | 6 | 20 | 38 |
+| RX D3 | GP5 | 7 | 21 | 40 |
+| RX RDY (eșantion gata) | GP9 | 12 | 25 | 22 |
+| RX CLK | GP13 | 17 | 6 | 31 |
+| SPI MISO | GP16 | 21 | 9 | 21 |
+| SPI CE0 | GP17 | 22 | 8 | 24 |
+| SPI SCLK | GP18 | 24 | 11 | 23 |
+| SPI MOSI | GP19 | 25 | 10 | 19 |
+| SPI CE1 (ținut sus) | GP28 | 34 | 7 | 26 |
+| GND | GND | 3, 8, 13, 18, 23, 28, 33, 38 | GND | 6, 9, 14, 20, 25, 30, 34, 39 |
+
+Leagă **cel puțin 3–4 fire de GND** între plăci, distribuite printre semnalele RX. Pe fluxul
+de date contează mai mult masa decât lungimea firelor. Ține firele RX sub ~10 cm.
+
+Alimentarea Radioberry rămâne cea din §2. Nivelurile sunt 3,3 V pe ambele părți (FPGA-ul
+Radioberry e pe 3,3 V, ca Pi-ul), deci nu trebuie translatoare.
+
+### 0.2 Audio și UI (pe Pico)
+
+| Funcție | Pico GP | Pico pin fizic | Legătură |
+|---|---|---|---|
+| I2S DATA | GP6 | 9 | PCM5102A DIN |
+| I2S BCK | GP7 | 10 | PCM5102A BCK |
+| I2S LRCK | GP8 | 11 | PCM5102A LRCK |
+| OLED SDA (I2C1) | GP14 | 19 | SH1106 SDA |
+| OLED SCL (I2C1) | GP15 | 20 | SH1106 SCL |
+| Encoder A | GP10 | 14 | encoder CLK/A |
+| Encoder B | GP11 | 15 | encoder DT/B |
+| Encoder SW | GP12 | 16 | apăsare: pasul de acord (10 Hz…100 kHz) |
+| Buton 1 | GP20 | 26 | bring-up: flux IQ binar pe USB on/off |
+| Buton 2 | GP21 | 27 | bring-up: reîncarcă FPGA-ul |
+| 3V3 | 3V3 OUT | 36 | OLED VCC, PCM5102A VIN, comunul encoderului NU (vezi dedesubt) |
+
+Encoderul și butoanele: pull-up intern în Pico, **contactul spre GND** (comunul encoderului la
+GND, nu la 3V3). Strapurile PCM5102A rămân cele din §1.2 (SCK→GND, XSMT→3V3 etc.).
+OLED-ul SH1106 la adresa 0x3C; offset-ul de 2 coloane îl tratează biblioteca U8g2.
+
+### 0.3 RP2350-PiZero (build final)
+
+Pe Waveshare RP2350-PiZero, Radioberry se infige direct în header, deci se folosesc chiar
+GPIO-urile BCM din coloana a patra, dacă maparea header → GPIO a plăcii e 1:1 (de verificat pe
+schema Waveshare). Programul PIO nu depinde de pini ficși, doar D0–D3 trebuie consecutivi
+(18–21 sunt). OLED/encoder/butoane se mută pe GPIO-urile rămase libere ale RP2350B (48 total).
+
+---
+
+## 1. Harta de pini — Pico 2 *(VECHE, depășită de §0)*
 
 Pinii sunt notati `GPn` (numar GPIO) / `#nn` (numar fizic pe header).
 
@@ -309,7 +374,7 @@ integritatea semnalului, SD, USB host si bateria dintr-un foc.
 
 ---
 
-## 9. Rezumat cablaj — varianta A (Pico 2)
+## 9. Rezumat cablaj — varianta A (Pico 2) *(VECHI — vezi §0)*
 
 | Pico GP | Pico # | Semnal | Merge la |
 |---------|--------|--------|----------|
