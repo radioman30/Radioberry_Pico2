@@ -4,8 +4,10 @@
 //       -> decimare /4 (12 kHz) -> filtru complex trece-bandă -> demodulare -> AGC -> I2S 12 kHz.
 // Protocol și capcane: PROTOCOL.md §6. Doar pe RP2350-PiZero (Radioberry înfipt în header).
 //
-// UI (meniu cu un singur buton): apăsare scurtă = parametrul următor (FRECV > PAS > MOD > VOL > GAIN);
+// UI (meniu cu un singur buton): apăsare scurtă = parametrul următor (FRECV > PAS > MOD > BANDA > VOL > GAIN);
 //     rotire = schimbă parametrul evidențiat; apăsare lungă sau 6 s fără atingere = înapoi la FRECV.
+// Butonul BOOT de pe PiZero = banda următoare (header-ul nu mai are pini liberi; BOOT se citește din QSPI CS).
+//     Fiecare bandă își ține minte ultima frecvență și ultimul mod.
 // USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
@@ -242,6 +244,12 @@ static inline uint8_t rx_byte(uint32_t a) {
                    (((a >>  9) & 1) << 1) |  ((a >> 15) & 1));
 }
 static uint32_t cnt_iq = 0;
+
+// Captură pentru spectru: nucleul 1 cere un bloc, nucleul 0 copiază 256 de perechi IQ consecutive.
+#define FFT_N 256
+static float cap_i[FFT_N], cap_q[FFT_N];
+static volatile bool cap_req = false, cap_ready = false;
+static int cap_n = 0;
 static int32_t prev_i = 0;
 
 static void rx_poll() {
@@ -258,7 +266,12 @@ static void rx_poll() {
     // cadrul n aduce Q[n-1] și I[n]: perechea corectă e (I din cadrul anterior, Q din cadrul curent).
     // O decalare I/Q de un eșantion strică suprimarea benzii laterale opuse la SSB.
     float out;
-    if (dsp_push(prev_i / 8388608.0f, q / 8388608.0f, &out)) audio_out_push(out);
+    float fi = prev_i / 8388608.0f, fq = q / 8388608.0f;
+    if (dsp_push(fi, fq, &out)) audio_out_push(out);
+    if (cap_req) {
+      cap_i[cap_n] = fi; cap_q[cap_n] = fq;
+      if (++cap_n >= FFT_N) { cap_n = 0; __dmb(); cap_req = false; cap_ready = true; }
+    }
     prev_i = i;
     cnt_iq++;
   }
@@ -405,6 +418,45 @@ static volatile int32_t enc_delta = 0;
 static const uint32_t STEPS[] = { 10, 100, 1000, 10000, 100000 };
 static int step_idx = 1;
 
+// Benzi: radioamatori HF + radiodifuziune AM. Frecvența/modul se memorează la părăsirea benzii.
+struct Band { const char *name; uint32_t lo, hi, f; int mode; };
+static Band BANDS[] = {
+  { "160m", 1810000, 2000000, 1840000, MODE_LSB },
+  { "80m",  3500000, 3800000, 3700000, MODE_LSB },
+  { "60m",  5351500, 5366500, 5357000, MODE_USB },
+  { "49m",  5900000, 6200000, 6000000, MODE_AM },
+  { "40m",  7000000, 7200000, 7100000, MODE_LSB },
+  { "41m",  7200000, 7450000, 7300000, MODE_AM },
+  { "31m",  9400000, 9900000, 9650000, MODE_AM },
+  { "30m", 10100000, 10150000, 10120000, MODE_CW },
+  { "20m", 14000000, 14350000, 14200000, MODE_USB },
+  { "17m", 18068000, 18168000, 18130000, MODE_USB },
+  { "15m", 21000000, 21450000, 21200000, MODE_USB },
+  { "12m", 24890000, 24990000, 24940000, MODE_USB },
+  { "10m", 28000000, 29700000, 28500000, MODE_USB },
+};
+static const int NBANDS = sizeof(BANDS) / sizeof(BANDS[0]);
+
+// banda în care e frecvența curentă (-1 = în afara benzilor)
+static int band_of(uint32_t f) {
+  for (int b = 0; b < NBANDS; b++) if (f >= BANDS[b].lo && f <= BANDS[b].hi) return b;
+  return -1;
+}
+
+static void band_step(int dir) {
+  uint32_t f = g_freq;
+  int cur = band_of(f);
+  if (cur >= 0) { BANDS[cur].f = f; BANDS[cur].mode = g_mode; }   // memorează unde ai rămas
+  int nb;
+  if (cur >= 0) nb = ((cur + dir) % NBANDS + NBANDS) % NBANDS;
+  else {                                       // în afara benzilor: următoarea peste/sub frecvență
+    nb = dir > 0 ? 0 : NBANDS - 1;
+    for (int b = 0; b < NBANDS; b++) if (BANDS[b].lo > f) { nb = dir > 0 ? b : (b + NBANDS - 1) % NBANDS; break; }
+  }
+  g_mode = BANDS[nb].mode; g_mode_dirty = true;
+  g_freq = BANDS[nb].f; g_freq_dirty = true;
+}
+
 static void enc_isr() {
   static uint8_t prev = 0; static int8_t acc = 0;
   static const int8_t TAB[16] = { 0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0 };
@@ -423,21 +475,111 @@ void setup1() {
   oled.begin();
 }
 
-enum { UI_FREQ, UI_STEP, UI_MODE, UI_VOL, UI_GAIN, UI_N };
+enum { UI_FREQ, UI_STEP, UI_MODE, UI_BAND, UI_VOL, UI_GAIN, UI_N };
 static int ui_sel = UI_FREQ;
 
-// text cu fundal inversat când e selectat
-static void draw_item(int x, int y, const char *txt, bool sel) {
-  if (sel) {
-    oled.drawBox(x - 1, y - 9, (int)strlen(txt) * 6 + 2, 11);
-    oled.setDrawColor(0); oled.drawStr(x, y, txt); oled.setDrawColor(1);
-  } else {
-    oled.drawStr(x, y, txt);
+// ---------------- spectru + waterfall ----------------
+// IQ 48 kHz, FFT 256 (187,5 Hz/bin) -> 128 coloane (375 Hz/coloană) = ±24 kHz în jurul frecvenței.
+#define SP_X 128
+#define SP_Y0 11            // spectrul: rândurile 11..32
+#define SP_H 22
+#define WF_Y0 33            // waterfall: rândurile 33..55
+#define WF_H 23
+static float fft_re[FFT_N], fft_im[FFT_N], win[FFT_N];
+static float sp_db[SP_X];                    // spectru netezit, dB
+static uint8_t wf[WF_H][SP_X];              // intensitate 0..16
+static int wf_top = 0;                       // rândul cel mai nou (buffer circular)
+static float sp_floor = -100;
+
+static void fft256(float *re, float *im) {
+  for (int i = 1, j = 0; i < FFT_N; i++) {              // permutare bit-inversată
+    int bit = FFT_N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { float t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
   }
+  for (int len = 2; len <= FFT_N; len <<= 1) {
+    float ang = -2 * (float)M_PI / len, wr = cosf(ang), wi = sinf(ang);
+    for (int i = 0; i < FFT_N; i += len) {
+      float cr = 1, ci = 0;
+      for (int k = 0; k < len / 2; k++) {
+        int u = i + k, v = i + k + len / 2;
+        float tr = re[v] * cr - im[v] * ci, ti = re[v] * ci + im[v] * cr;
+        re[v] = re[u] - tr; im[v] = im[u] - ti; re[u] += tr; im[u] += ti;
+        float ncr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = ncr;
+      }
+    }
+  }
+}
+
+static void spectrum_update() {
+  __dmb();
+  for (int k = 0; k < FFT_N; k++) { fft_re[k] = cap_i[k] * win[k]; fft_im[k] = cap_q[k] * win[k]; }
+  cap_ready = false;                                    // nucleul 0 poate umple următorul bloc
+  fft256(fft_re, fft_im);
+  float col[SP_X];
+  for (int c = 0; c < SP_X; c++) {
+    // fftshift: coloana 0 = -24 kHz, 64 = frecvența acordată, 127 = +24 kHz
+    int b0 = (2 * c + FFT_N / 2) % FFT_N, b1 = (b0 + 1) % FFT_N;
+    float p0 = fft_re[b0] * fft_re[b0] + fft_im[b0] * fft_im[b0];
+    float p1 = fft_re[b1] * fft_re[b1] + fft_im[b1] * fft_im[b1];
+    col[c] = 10 * log10f((p0 > p1 ? p0 : p1) + 1e-20f);
+  }
+  col[64] = 0.5f * (col[63] + col[65]);                 // ascunde vârful DC al convertorului
+  // nivelul zgomotului = percentila 25 (robust la stații)
+  float tmp[SP_X]; memcpy(tmp, col, sizeof(tmp));
+  for (int i = 1; i < SP_X; i++) { float v = tmp[i]; int j = i - 1; while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; } tmp[j + 1] = v; }
+  sp_floor = 0.8f * sp_floor + 0.2f * tmp[SP_X / 4];
+  for (int c = 0; c < SP_X; c++) sp_db[c] = 0.5f * sp_db[c] + 0.5f * col[c];
+  // rând nou în waterfall: 0..16 pe 40 dB peste zgomot
+  wf_top = (wf_top + WF_H - 1) % WF_H;
+  for (int c = 0; c < SP_X; c++) {
+    float v = (col[c] - sp_floor - 3) * 16.0f / 37.0f;
+    wf[wf_top][c] = (uint8_t)(v < 0 ? 0 : v > 16 ? 16 : v);
+  }
+}
+
+static const uint8_t BAYER4[4][4] = { { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 } };
+
+static void spectrum_draw() {
+  // spectru: 40 dB pe SP_H pixeli, de la zgomot în sus
+  for (int c = 0; c < SP_X; c++) {
+    int h = (int)((sp_db[c] - sp_floor + 2) * SP_H / 40.0f);
+    if (h < 0) h = 0; if (h > SP_H) h = SP_H;
+    if (h) oled.drawVLine(c, SP_Y0 + SP_H - h, h);
+  }
+  // marcaj frecvență acordată + banda filtrului (375 Hz/coloană)
+  for (int y = SP_Y0; y < SP_Y0 + SP_H; y += 3) oled.drawPixel(64, y);
+  float lo, hi;
+  switch (g_mode) {
+    case MODE_USB: lo = 250; hi = 2850; break;
+    case MODE_LSB: lo = -2850; hi = -250; break;
+    case MODE_CW:  lo = 450; hi = 950; break;
+    default:       lo = -4000; hi = 4000; break;
+  }
+  int x0 = 64 + (int)floorf(lo / 375.0f), x1 = 64 + (int)ceilf(hi / 375.0f);
+  oled.drawHLine(x0, SP_Y0, x1 - x0 + 1);
+  // waterfall cu dithering ordonat (monocrom)
+  for (int r = 0; r < WF_H; r++) {
+    const uint8_t *row = wf[(wf_top + r) % WF_H];
+    int y = WF_Y0 + r;
+    for (int c = 0; c < SP_X; c++)
+      if (row[c] > BAYER4[y & 3][c & 3]) oled.drawPixel(c, y);
+  }
+}
+
+// text cu fundal inversat când e selectat (font 5x7)
+static int draw_item(int x, int y, const char *txt, bool sel) {
+  int w = (int)strlen(txt) * 5;
+  if (sel) { oled.drawBox(x - 1, y - 7, w + 1, 8); oled.setDrawColor(0); oled.drawStr(x, y, txt); oled.setDrawColor(1); }
+  else oled.drawStr(x, y, txt);
+  return x + w + 4;
 }
 
 void loop1() {
   static uint32_t t_draw = 0, t_down = 0, t_act = 0; static bool down = false, long_done = false;
+  static bool win_done = false;
+  if (!win_done) { for (int k = 0; k < FFT_N; k++) win[k] = 0.5f - 0.5f * cosf(2 * (float)M_PI * k / (FFT_N - 1)); win_done = true; }
 
   int32_t d; noInterrupts(); d = enc_delta; enc_delta = 0; interrupts();
   if (d) {
@@ -450,6 +592,7 @@ void loop1() {
       }
       case UI_STEP: step_idx = constrain(step_idx + (int)d, 0, 4); break;
       case UI_MODE: g_mode = ((g_mode + (int)d) % MODE_N + MODE_N) % MODE_N; g_mode_dirty = true; break;
+      case UI_BAND: band_step(d > 0 ? 1 : -1); break;
       case UI_VOL:  g_vol = constrain(g_vol + 2 * (int)d, 0, 100); break;
       case UI_GAIN: g_gain_db = constrain(g_gain_db + (int)d, -12, 48); g_gain_dirty = true; break;
     }
@@ -463,32 +606,46 @@ void loop1() {
   }
   if (ui_sel != UI_FREQ && millis() - t_act > 6000) ui_sel = UI_FREQ;
 
-  if (millis() - t_draw < 100) return;
+  // butonul BOOT = banda următoare. Citirea oprește nucleul 0 câteva µs (FIFO-ul FPGA ține ~5 ms).
+  static uint32_t t_boot = 0; static bool boot_down = false;
+  if (g_ui_ready && millis() - t_boot >= 40) {
+    t_boot = millis();
+    bool b = BOOTSEL;
+    if (b && !boot_down) { band_step(1); t_act = t_boot; }
+    boot_down = b;
+  }
+
+  // spectru: cere un bloc nou, procesează-l când e gata
+  if (cap_ready) spectrum_update();
+  else if (!cap_req) { cap_n = 0; __dmb(); cap_req = true; }
+
+  if (millis() - t_draw < 80) return;
   t_draw = millis();
   char l[24];
   uint32_t f = g_freq;
   oled.clearBuffer();
-  oled.setFont(u8g2_font_10x20_tf);
-  snprintf(l, sizeof(l), "%2lu.%03lu.%02lu", (unsigned long)(f / 1000000), (unsigned long)(f / 1000 % 1000),
-           (unsigned long)(f % 1000 / 10));
-  oled.drawStr(0, 18, l);
-  if (ui_sel == UI_FREQ) oled.drawHLine(0, 20, 100);   // frecvența e cea acordată de encoder
+  // rândul de sus: frecvența (mare-mică) + modul
   oled.setFont(u8g2_font_6x10_tf);
+  snprintf(l, sizeof(l), "%lu.%03lu.%02lu", (unsigned long)(f / 1000000), (unsigned long)(f / 1000 % 1000),
+           (unsigned long)(f % 1000 / 10));
+  oled.drawStr(0, 9, l);
+  if (ui_sel == UI_FREQ) oled.drawHLine(0, 10, (int)strlen(l) * 6);
+  oled.setFont(u8g2_font_5x7_tf);
+  int bd = band_of(f);
+  draw_item(58, 8, bd >= 0 ? BANDS[bd].name : "--", ui_sel == UI_BAND);
+  draw_item(82, 8, MODE_NAME[g_mode], ui_sel == UI_MODE);
+  snprintf(l, sizeof(l), "%4.0f", g_smeter_db); oled.drawStr(108, 8, l);
 
-  snprintf(l, sizeof(l), "%s", MODE_NAME[g_mode]);                draw_item(0, 33, l, ui_sel == UI_MODE);
+  spectrum_draw();
+
+  // rândul de jos: pas, volum, câștig
+  int x = 0;
   uint32_t st = STEPS[step_idx];
-  if (st >= 1000) snprintf(l, sizeof(l), "%luk", (unsigned long)(st / 1000)); else snprintf(l, sizeof(l), "%lu", (unsigned long)st);
-  draw_item(30, 33, l, ui_sel == UI_STEP);
-  snprintf(l, sizeof(l), "V%d", g_vol);                           draw_item(62, 33, l, ui_sel == UI_VOL);
-  snprintf(l, sizeof(l), "G%+d", g_gain_db);                      draw_item(96, 33, l, ui_sel == UI_GAIN);
-
-  // S-metru: -130..-40 dBFS pe 100 px
-  float sm = g_smeter_db; int w = (int)((sm + 130) * 100 / 90); if (w < 0) w = 0; if (w > 100) w = 100;
-  oled.drawFrame(0, 40, 102, 8); oled.drawBox(1, 41, w, 6);
-  snprintf(l, sizeof(l), "%4.0f", sm); oled.drawStr(104, 48, l);
-
-  static const char *SEL_NAME[UI_N] = { "acord", "pas", "mod", "volum", "castig" };
-  snprintf(l, sizeof(l), "%s  > %s", g_fpga == 1 ? "RB" : "ERR", SEL_NAME[ui_sel]);
-  oled.drawStr(0, 62, l);
+  if (st >= 1000) snprintf(l, sizeof(l), "P%luk", (unsigned long)(st / 1000)); else snprintf(l, sizeof(l), "P%lu", (unsigned long)st);
+  x = draw_item(x + 1, 63, l, ui_sel == UI_STEP);
+  snprintf(l, sizeof(l), "V%d", g_vol);           x = draw_item(x, 63, l, ui_sel == UI_VOL);
+  snprintf(l, sizeof(l), "G%+d", g_gain_db);      x = draw_item(x, 63, l, ui_sel == UI_GAIN);
+  if (g_fpga != 1) oled.drawStr(100, 63, "ERR");
+  else oled.drawStr(98, 63, "-24 +24");
   oled.sendBuffer();
 }
