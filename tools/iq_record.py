@@ -1,7 +1,7 @@
 """Înregistrează IQ-ul de la rx_audio (USB) într-un WAV pe care HDSDR / SDR# / SDR++ îl redau direct.
 
-    python tools/iq_record.py                 # 30 s, COM10, în folderul curent
-    python tools/iq_record.py -t 120 -p COM10 -o D:\\IQ
+    python tools/iq_record.py                 # 30 s, portul plăcii găsit singur, în folderul curent
+    python tools/iq_record.py -t 120 -p COM12 -o D:\\IQ
 
 Firmware: comanda q1 pornește fluxul (perechi I,Q pe 24 de biți, 48 kHz), q0 îl oprește.
 Fișierul: WAV stereo 24 de biți (stânga = I, dreapta = Q), cu chunk `auxi` (frecvența centrală, ora)
@@ -16,6 +16,7 @@ import sys
 import time
 
 import serial
+import serial.tools.list_ports
 
 FS = 48000
 PAIR = 6  # octeți pe pereche I,Q (2 × 24 de biți)
@@ -38,14 +39,25 @@ def write_wav(path, data, freq, t_start, t_stop):
         f.write(b"RIFF" + struct.pack("<I", len(body)) + body)
 
 
+def find_port():
+    """Portul plăcii: VID 2E8A (Raspberry Pi); PID 10F1 = rx_audio cu microfon USB."""
+    ports = [p for p in serial.tools.list_ports.comports() if p.vid == 0x2E8A]
+    ports.sort(key=lambda p: p.pid != 0x10F1)
+    if not ports:
+        sys.exit("placa nu e conectată (niciun port cu VID 2E8A)")
+    return ports[0].device
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-p", "--port", default="COM10")
+    ap.add_argument("-p", "--port", help="implicit: găsit după VID/PID")
     ap.add_argument("-t", "--seconds", type=float, default=30)
     ap.add_argument("-o", "--outdir", default=".")
     a = ap.parse_args()
 
-    s = serial.Serial(a.port, 115200, timeout=1)
+    port = a.port or find_port()
+    print("port:", port)
+    s = serial.Serial(port, 115200, timeout=1)
     s.dtr = True
     s.write(b"q0\n"); time.sleep(0.3); s.reset_input_buffer()
 

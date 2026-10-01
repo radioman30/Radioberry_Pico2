@@ -22,6 +22,8 @@
 #include <U8g2lib.h>
 #include <math.h>
 #include <EEPROM.h>
+#include <Adafruit_TinyUSB.h>          // stiva USB „Adafruit TinyUSB": CDC + microfon USB
+#include "usb_audio.h"
 struct Settings;                    // definită mai jos; aici doar pt. prototipurile generate de Arduino
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
@@ -193,6 +195,8 @@ static void design_bandpass(int mode) {
 }
 
 // un eșantion IQ la 48 kHz -> 0 sau 1 eșantion audio (la 12 kHz)
+static float g_dsp_raw = 0;                          // ieșirea demodulatorului fără volumul căștilor (pt. USB)
+
 static bool dsp_push(float I, float Q, float *out) {
   dI[dpos] = dI[dpos + NDEC] = I;
   dQ[dpos] = dQ[dpos + NDEC] = Q;
@@ -225,7 +229,8 @@ static bool dsp_push(float I, float Q, float *out) {
     pr = yr; pq = yi;
     d *= 12000.0f / (2 * (float)M_PI * 3000.0f);     // ±3 kHz deviație -> ±1
     de += 0.41f * (d - de);                          // de-accentuare, pol la ~1 kHz
-    *out = de * 0.5f * (g_vol / 100.0f);             // FM are amplitudine constantă: fără AGC
+    g_dsp_raw = de * 0.5f;
+    *out = g_dsp_raw * (g_vol / 100.0f);             // FM are amplitudine constantă: fără AGC
     return true;
   } else if (mode == MODE_AM) {
     float env = sqrtf(p);
@@ -239,7 +244,8 @@ static bool dsp_push(float I, float Q, float *out) {
   agc_env = (m > agc_env) ? m : agc_env * 0.99983f;
   if (agc_env < 3e-6f) agc_env = 3e-6f;
   float g = 0.3f / agc_env;
-  *out = a * g * (g_vol / 100.0f);
+  g_dsp_raw = a * g;
+  *out = g_dsp_raw * (g_vol / 100.0f);
   return true;
 }
 
@@ -342,7 +348,7 @@ static void rx_poll() {
     // atunci -> corelație 0,54 și imagini doar ~10 dB sub semnal (bandă laterală opusă slab suprimată).
     float out;
     float fi = i / 8388608.0f, fq = (g_iq_inv ? -q : q) / 8388608.0f;
-    if (dsp_push(fi, fq, &out)) audio_out_push(out);
+    if (dsp_push(fi, fq, &out)) { audio_out_push(out); usb_audio_push12k(g_dsp_raw); }
     if (cap_req) {
       cap_i[cap_n] = fi; cap_q[cap_n] = fq;
       if (++cap_n >= FFT_N) { cap_n = 0; __dmb(); cap_req = false; cap_ready = true; }
@@ -384,6 +390,7 @@ static void radio_start() {
 static void settings_load();
 
 void setup() {
+  usb_audio_begin();
   settings_load();
   Serial.begin(115200);
   design_lowpass(h_dec, NDEC, 4500, FS_IN);
@@ -504,9 +511,10 @@ static void handle_cmd(const char *s) {
   if (s[0] == 'm' && v >= 0 && v < MODE_N)        { g_mode = v; g_mode_dirty = true; }
   if (s[0] == 'v' && v >= 0 && v <= 100)          g_vol = v;
   if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; g_gain_dirty = true; }
-  Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s | S %.1f dBFS | drop %lu under %lu\n",
+  Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s | S %.1f dBFS | drop %lu under %lu | mic USB %s (aruncate %lu)\n",
                 g_fpga == 1 ? "OK" : "ERR", g_gw_major, g_gw_minor, (unsigned long)g_freq, MODE_NAME[g_mode],
-                g_vol, g_gain_db, (unsigned long)g_iq_rate, g_smeter_db, (unsigned long)g_audio_drop, (unsigned long)g_audio_under);
+                g_vol, g_gain_db, (unsigned long)g_iq_rate, g_smeter_db, (unsigned long)g_audio_drop, (unsigned long)g_audio_under,
+                usb_audio_streaming() ? "activ" : "oprit", (unsigned long)usb_audio_drops());
 }
 
 void loop() {

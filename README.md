@@ -20,9 +20,15 @@ waterfall pe OLED-ul 128x64, encoder cu meniu, benzi cu memorie, filtre selectab
    (merge și 73.4 din [Radioberry-2.x `SBC/rpi-4/releases/dev/CL025`](https://github.com/pa3gsb/Radioberry-2.x/tree/master/SBC/rpi-4/releases/dev/CL025)),
    apoi `python tools/make_gateware_header.py <cale>/radioberry.rbf` și copiază
    `firmware/rb_bringup/gateware_cl025.h` în `firmware/rx_audio/`.
-2. **Compilare:** arduino-pico (core `rp2040:rp2040` 5.x), placa `waveshare_rp2350_pizero`, biblioteca U8g2.
+2. **Compilare:** arduino-pico (core `rp2040:rp2040` 5.x), placa `waveshare_rp2350_pizero`, biblioteca U8g2,
+   stiva USB **Adafruit TinyUSB** + flag-urile pentru microfonul USB — totul în
+   `powershell -File toolsuild_rx_audio.ps1 [-Flash]`.
 3. **Cablaj:** [`WIRING.md`](WIRING.md) §0.5 (header complet, PCM5102A, OLED, encoder) și §0.6 (butoane pe un pin).
 4. **Protocolul** și capcanele (bit DUPLEX, câștig RX, ordinea octeților, SPI mode 3): [`PROTOCOL.md`](PROTOCOL.md) §6.
+
+**Pe USB, placa apare ca:** port serial (comenzi) + **microfon „Radioberry RX audio"** (48 kHz mono, audio
+demodulat fără volumul căștilor → WSJT-X, fldigi, înregistrare). IQ-ul brut se înregistrează cu
+`python tools/iq_record.py -t 60 -o iq_rec` → WAV pentru HDSDR / SDR# / SDR++.
 
 Comenzi USB (115200): `s` stare, `f<Hz>`, `m<0-3>`, `v<0-100>`, `g<-12..48>`, `w<Hz>` filtru, `k` butoane,
 `x` inversează IQ, `z<start,stop,pas kHz>` baleiaj.
