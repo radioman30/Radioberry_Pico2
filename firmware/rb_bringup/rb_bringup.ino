@@ -65,6 +65,7 @@ static int fpga_load() {
 #if !HAVE_GATEWARE
   return 2;
 #else
+  gpio_set_dir(PIN_FPGA_DATA0, GPIO_OUT);
   gpio_put(PIN_FPGA_NCONFIG, 0);
   gpio_put(PIN_FPGA_DATA0, 0);
   gpio_put(PIN_FPGA_DCLK, 0);
@@ -357,7 +358,45 @@ static void spi_deep_probe() {
   spi_set_format(RB_SPI, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
 }
 
+// Test „gpio-mode" (ca în driverul PA3GSB SBC/rpi-5/archive/gpio-mode): RDY=1 -> 6 octeți,
+// fiecare citit pe 8 linii BCM 23,20,19,18,16,13,12,5 (bit 7..0), ceasul RX (BCM6) comutat de mână.
+// Doar pe RP2350-PiZero (Radioberry înfipt, toate liniile pe header).
+#if defined(ARDUINO_WAVESHARE_RP2350_PIZERO)
+static const int GM_PINS[8] = { 23, 20, 19, 18, 16, 13, 9, 15 };   // GP pentru BCM 23,20,19,18,16,13,12,5
+static void gpio_mode_test() {
+  pio_sm_set_enabled(rx_pio, rx_sm, false);
+  gpio_init(PIN_RX_CLK); gpio_set_dir(PIN_RX_CLK, GPIO_OUT); gpio_put(PIN_RX_CLK, 0);
+  for (int i = 0; i < 8; i++) { gpio_init(GM_PINS[i]); gpio_set_dir(GM_PINS[i], GPIO_IN); }
+  for (int p = PIN_RX_D0; p <= PIN_RX_D3; p++) gpio_init(p), gpio_set_dir(p, GPIO_IN);
+  // cât de des urcă RDY în 100 ms
+  uint32_t rises = 0, t0 = millis(); int last = gpio_get(PIN_RX_RDY);
+  while (millis() - t0 < 100) { int v = gpio_get(PIN_RX_RDY); if (v && !last) rises++; last = v; }
+  Serial.printf("RDY: %lu fronturi in 100 ms (cu ceasul oprit)\n", (unsigned long)rises);
+  for (int smp = 0; smp < 8; smp++) {
+    uint32_t tw = micros();
+    while (!gpio_get(PIN_RX_RDY)) if (micros() - tw > 200000) { Serial.println("RDY nu urca (200 ms)"); goto done; }
+    uint8_t b[6];
+    for (int i = 0; i < 6; i++) {
+      gpio_put(PIN_RX_CLK, (i % 2 == 0) ? 1 : 0);
+      delayMicroseconds(1);
+      uint8_t v = 0;
+      for (int k = 0; k < 8; k++) v |= gpio_get(GM_PINS[k]) << (7 - k);
+      b[i] = v;
+    }
+    Serial.printf("esantion %d: %02X %02X %02X  %02X %02X %02X\n", smp, b[0], b[1], b[2], b[3], b[4], b[5]);
+  }
+done:
+  // înapoi la PIO
+  pio_gpio_init(rx_pio, PIN_RX_CLK);
+  for (int p = PIN_RX_D0; p <= PIN_RX_D3; p++) pio_gpio_init(rx_pio, p);
+  pio_sm_set_enabled(rx_pio, rx_sm, true);
+}
+#else
+static void gpio_mode_test() { Serial.println("testul g e doar pentru RP2350-PiZero"); }
+#endif
+
 static void handle_command(const char *s) {
+  if (s[0] == 'g') { gpio_mode_test(); return; }
   if (s[0] == 'x') { spi_deep_probe(); return; }
   if (s[0] == 'p') { print_pins(); print_load_diag(); return; }
   if (s[0] == 'w') { dump_words(); return; }
@@ -385,6 +424,13 @@ static void poll_usb_commands() {
 
 static void do_fpga_bringup() {
   g_fpga_state = fpga_load();
+  // Logica din FPGA rămâne în reset până se blochează PLL-ul. Contorul de biți al slave-ului SPI
+  // (48 biți/cadru) NU se resetează la CS sus, doar la reset: un cadru trimis exact când resetul se
+  // eliberează rămâne trunchiat și decalează toate cadrele următoare. Deci: așteaptă ieșirea din reset.
+  if (g_fpga_state == 1) {
+    gpio_set_dir(PIN_FPGA_DATA0, GPIO_IN);         // BCM13: în gpio-mode e ieșire de date a FPGA-ului
+    delay(200);
+  }
   if (g_fpga_state == 1 || g_fpga_state == 2) rb_configure();
 }
 
