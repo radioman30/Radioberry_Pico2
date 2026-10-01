@@ -8,6 +8,8 @@
 //     rotire = schimbă parametrul evidențiat; apăsare lungă sau 6 s fără atingere = înapoi la FRECV.
 // Butonul BOOT de pe PiZero = banda următoare (header-ul nu mai are pini liberi; BOOT se citește din QSPI CS).
 //     Fiecare bandă își ține minte ultima frecvență și ultimul mod.
+// Setările (frecvență, mod, pas, filtre, volum, câștig, memoria benzilor) se salvează în flash la 5 s
+//     după ultima schimbare și se reîncarcă la pornire.
 // USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
@@ -17,6 +19,8 @@
 #include <I2S.h>
 #include <U8g2lib.h>
 #include <math.h>
+#include <EEPROM.h>
+struct Settings;                    // definită mai jos; aici doar pt. prototipurile generate de Arduino
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "gateware_cl025.h"
@@ -328,7 +332,10 @@ static void radio_start() {
   g_ui_ready = true;
 }
 
+static void settings_load();
+
 void setup() {
+  settings_load();
   Serial.begin(115200);
   design_lowpass(h_dec, NDEC, 4500, FS_IN);
   design_bandpass(g_mode); g_mode_dirty = false;
@@ -498,6 +505,67 @@ static void enc_isr() {
   if (acc <= -4) { enc_delta--; acc = 0; }
 }
 
+// ---------------- setări salvate în flash ----------------
+// Scrierea șterge un sector de 4 KB (~50 ms, cu nucleul 0 oprit): se face rar, după 5 s fără modificări.
+struct Settings {
+  uint32_t magic;
+  uint32_t freq;
+  uint8_t  mode, step, vol; int8_t gain;
+  uint8_t  bw[MODE_N];
+  uint32_t band_f[NBANDS];
+  uint8_t  band_mode[NBANDS];
+  uint32_t sum;
+};
+static const uint32_t SET_MAGIC = 0x52425331;          // "RBS1"; schimbă-l când se schimbă structura
+static Settings set_saved;
+
+static uint32_t settings_sum(const Settings &x) {
+  const uint8_t *b = (const uint8_t *)&x; uint32_t h = 2166136261u;
+  for (size_t k = 0; k < offsetof(Settings, sum); k++) h = (h ^ b[k]) * 16777619u;   // FNV-1a
+  return h;
+}
+
+static void settings_snapshot(Settings &x) {
+  memset(&x, 0, sizeof(x));
+  x.magic = SET_MAGIC; x.freq = g_freq; x.mode = g_mode; x.step = step_idx;
+  x.vol = g_vol; x.gain = g_gain_db;
+  for (int m = 0; m < MODE_N; m++) x.bw[m] = g_bw_idx[m];
+  for (int b = 0; b < NBANDS; b++) { x.band_f[b] = BANDS[b].f; x.band_mode[b] = BANDS[b].mode; }
+  x.sum = settings_sum(x);
+}
+
+static void settings_load() {
+  EEPROM.begin(sizeof(Settings) < 256 ? 256 : 512);
+  Settings x; EEPROM.get(0, x);
+  if (x.magic == SET_MAGIC && x.sum == settings_sum(x)) {     // altfel: prima pornire, rămân valorile implicite
+    if (x.freq >= 10000 && x.freq <= 30000000) g_freq = x.freq;
+    if (x.mode < MODE_N) g_mode = x.mode;
+    if (x.step < 5) step_idx = x.step;
+    if (x.vol <= 100) g_vol = x.vol;
+    if (x.gain >= -12 && x.gain <= 48) g_gain_db = x.gain;
+    for (int m = 0; m < MODE_N; m++) if (x.bw[m] < bw_count(m)) g_bw_idx[m] = x.bw[m];
+    for (int b = 0; b < NBANDS; b++) {
+      if (x.band_f[b] >= BANDS[b].lo && x.band_f[b] <= BANDS[b].hi) BANDS[b].f = x.band_f[b];
+      if (x.band_mode[b] < MODE_N) BANDS[b].mode = x.band_mode[b];
+    }
+  }
+  settings_snapshot(set_saved);
+}
+
+// apelat din loop1: salvează când setările s-au schimbat și apoi au stat neatinse 5 s
+static void settings_poll() {
+  static Settings last; static uint32_t t_change = 0; static bool pending = false;
+  if (scan_on) return;                                   // baleiajul schimbă frecvența temporar
+  Settings now; settings_snapshot(now);
+  if (memcmp(&now, &last, sizeof(now)) != 0) { last = now; t_change = millis(); pending = true; return; }
+  if (!pending || millis() - t_change < 5000) return;
+  pending = false;
+  if (memcmp(&now, &set_saved, sizeof(now)) == 0) return;
+  EEPROM.put(0, now);
+  EEPROM.commit();
+  set_saved = now;
+}
+
 void setup1() {
   pinMode(PIN_ENC_A, INPUT_PULLUP);
   pinMode(PIN_ENC_B, INPUT_PULLUP);
@@ -633,6 +701,7 @@ void loop1() {
     down = now_down;
   }
   if (ui_sel != UI_FREQ && millis() - t_act > 6000) ui_sel = UI_FREQ;
+  settings_poll();
 
   // butonul BOOT = banda următoare. Citirea oprește nucleul 0 câteva µs (FIFO-ul FPGA ține ~5 ms).
   static uint32_t t_boot = 0; static bool boot_down = false;
