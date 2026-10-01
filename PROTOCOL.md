@@ -132,9 +132,11 @@ Deci: la fiecare RDY=1 host-ul generează 7 fronturi de ceas și citește 7 × 4
   Măsurat: -12 dB → -109,5 dBFS; 0 → -95; +20 → -76; +36 → -62,6 (zgomot de antenă dominant).
 - **RX (clasic):** RDY = BCM25 = FIFO > 256 eșantioane. Un eșantion = 6 fronturi ale ceasului RX (BCM6),
   un octet pe fiecare front (ieșire combinațională pe nivelul ceasului), pe 8 linii
-  bit 7..0 = BCM 23, 20, 19, 18, 16, 13, 12, 5. Ordinea octeților: **Q (eșantionul anterior) hi, mid, lo,
-  apoi I hi, mid, lo** (din `radioberry_core.v`: `tdata = qdata` după primul front, `idata` după al
-  4-lea). Ceasul RX trebuie ținut JOS de dinainte de încărcare (un front în plus după reset decalează
+  bit 7..0 = BCM 23, 20, 19, 18, 16, 13, 12, 5. Ordinea octeților: **Q hi, mid, lo, apoi I hi, mid, lo**
+  (din `radioberry_core.v`: `tdata = qdata` după primul front, `idata` după al 4-lea). **I și Q din
+  ACELAȘI cadru formează perechea** — verificat pe o înregistrare IQ (2 oct 2026): corelație I/Q 0,00 și
+  imagini la nivelul zgomotului; perechea (I din cadrul anterior, Q curent), presupusă inițial, dădea
+  corelație 0,54 și imagini doar ~10 dB sub semnal. Ceasul RX trebuie ținut JOS de dinainte de încărcare (un front în plus după reset decalează
   contoarele up/down). Driverul Pi 4 citește 63 de eșantioane per RDY.
 - **Pini RP2350-PiZero:** BCM 23,20,19,18,16,13,12,5 → GP 23,20,19,18,16,13,9,15; RDY GP25; CLK GP6.
   ⚠️ BCM16 și BCM23 sunt linii de date FPGA → conflict cu pinii I2S aleși înainte pe PiZero (GP16/GP23).

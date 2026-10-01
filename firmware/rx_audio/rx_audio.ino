@@ -12,7 +12,7 @@
 //     Rețeaua se detectează singură la pornire; fără ea, pinul 18 rămâne buton simplu, ca înainte.
 // Setările (frecvență, mod, pas, filtre, volum, câștig, memoria benzilor) se salvează în flash la 5 s
 //     după ultima schimbare și se reîncarcă la pornire.
-// USB (115200): s stare | f<Hz> frecvența | m<0-4> modul (USB LSB CW AM FM) | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB)
+// USB (115200): s stare | f<Hz> frecvența | m<0-4> modul (USB LSB CW AM FM) | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -295,7 +295,36 @@ static uint32_t cnt_iq = 0;
 static float cap_i[FFT_N], cap_q[FFT_N];
 static volatile bool cap_req = false, cap_ready = false;
 static int cap_n = 0;
-static int32_t prev_i = 0;
+
+// Flux IQ pe USB (comanda q1): perechi I,Q pe 24 de biți little-endian (6 octeți), 48 kHz, fără antet.
+// Nucleul 0 le pune într-un tampon circular, loop() le scrie cât acceptă USB-ul. Tampon plin = se
+// aruncă perechi întregi, deci fluxul rămâne aliniat la 6 octeți.
+#define IQB_PAIRS 8192
+static uint8_t iqb[IQB_PAIRS * 6];
+static volatile uint32_t iqb_w = 0, iqb_r = 0;          // în octeți
+static volatile bool g_stream = false;
+static uint32_t g_stream_drop = 0;
+
+static inline void iqb_push(int32_t I, int32_t Q) {
+  uint32_t w = iqb_w, used = (w - iqb_r + sizeof(iqb)) % sizeof(iqb);
+  if (used >= sizeof(iqb) - 6) { g_stream_drop++; return; }
+  uint8_t *d = &iqb[w];
+  d[0] = I; d[1] = I >> 8; d[2] = I >> 16; d[3] = Q; d[4] = Q >> 8; d[5] = Q >> 16;
+  iqb_w = (w + 6) % sizeof(iqb);
+}
+
+static void iqb_pump() {
+  while (iqb_r != iqb_w) {
+    uint32_t r = iqb_r, w = iqb_w;
+    uint32_t n = (w > r) ? w - r : sizeof(iqb) - r;          // până la capătul tamponului
+    int room = Serial.availableForWrite();
+    if (room <= 0) return;
+    if (n > (uint32_t)room) n = room;
+    n = Serial.write(&iqb[r], n);
+    if (!n) return;
+    iqb_r = (r + n) % sizeof(iqb);
+  }
+}
 
 static void rx_poll() {
   if (!gpio_get(PIN_RX_RDY)) return;
@@ -308,16 +337,17 @@ static void rx_poll() {
     }
     int32_t q = (int32_t)(((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8)) >> 8;
     int32_t i = (int32_t)(((uint32_t)b[3] << 24) | ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 8)) >> 8;
-    // cadrul n aduce Q[n-1] și I[n]: perechea corectă e (I din cadrul anterior, Q din cadrul curent).
-    // O decalare I/Q de un eșantion strică suprimarea benzii laterale opuse la SSB.
+    // Perechea corectă e I și Q din ACELAȘI cadru. Verificat pe o înregistrare IQ (2 oct 2026):
+    // (I[n],Q[n]) -> corelație I/Q 0,00, imagini la nivelul zgomotului; (I[n-1],Q[n]), folosit până
+    // atunci -> corelație 0,54 și imagini doar ~10 dB sub semnal (bandă laterală opusă slab suprimată).
     float out;
-    float fi = prev_i / 8388608.0f, fq = (g_iq_inv ? -q : q) / 8388608.0f;
+    float fi = i / 8388608.0f, fq = (g_iq_inv ? -q : q) / 8388608.0f;
     if (dsp_push(fi, fq, &out)) audio_out_push(out);
     if (cap_req) {
       cap_i[cap_n] = fi; cap_q[cap_n] = fq;
       if (++cap_n >= FFT_N) { cap_n = 0; __dmb(); cap_req = false; cap_ready = true; }
     }
-    prev_i = i;
+    if (g_stream) iqb_push(i, g_iq_inv ? -q : q);   // aceeași convenție ca spectrul: +f = USB
     cnt_iq++;
   }
 }
@@ -418,6 +448,20 @@ static void handle_cmd(const char *s) {
   if (s[0] == 'z') { scan_start(s + 1); return; }
   long v = atol(s + 1);
   if (s[0] == 'f' && v >= 10000 && v <= 30000000) { g_freq = v; g_freq_dirty = true; }
+  if (s[0] == 'q') {
+    if (s[1] == '1') {
+      iqb_r = iqb_w = 0; g_stream_drop = 0;
+      Serial.printf("IQ24 48000 %lu\n", (unsigned long)g_freq);   // ultimul text; de aici doar binar
+      Serial.flush();
+      g_stream = true;
+    } else {
+      g_stream = false;
+      delay(50); iqb_r = iqb_w;
+      Serial.printf("\nIQ stop, perechi pierdute %lu\n", (unsigned long)g_stream_drop);
+    }
+    return;
+  }
+  if (g_stream) return;                               // în timpul fluxului nu se scrie text
   if (s[0] == 'k' && s[1] == 'd') {                  // diagnostic rețea RC: cât durează încărcarea/descărcarea
     g_keys_pause = true; delay(400);                  // nucleul 1 termină ce măsura și lasă pinul
     auto rise = [](uint32_t low_ms) -> uint32_t {     // ține pinul jos low_ms, apoi pull-up: timp până citește 1
@@ -494,6 +538,7 @@ void loop() {
   }
   if (now - t_rate >= 1000) { t_rate = now; g_iq_rate = cnt_iq; cnt_iq = 0; }
   scan_tick();
+  if (g_stream) iqb_pump();
 
   while (Serial.available()) {
     char c = Serial.read();
@@ -805,7 +850,7 @@ void loop1() {
       if (key == K_STEP) step_idx = (step_idx + 1) % 5;
       if (key == K_BAND) { t_kdown = t; band_long = false; }
       if (key_prev == K_BAND && !band_long) band_step(1);
-      if (key != K_NONE) { t_act = t; if (g_keys_rc) Serial.printf("tasta %s: %lu us\n", KEY_NAME[key], (unsigned long)g_key_us); }
+      if (key != K_NONE) { t_act = t; if (g_keys_rc && !g_stream) Serial.printf("tasta %s: %lu us\n", KEY_NAME[key], (unsigned long)g_key_us); }
       key_prev = key;
     }
     if (key == K_BAND && !band_long && t - t_kdown > 700) { band_step(-1); band_long = true; }

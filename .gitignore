@@ -19,3 +19,7 @@ __pycache__/
 # gateware Radioberry (binar tert, nu se publica)
 firmware/*/gateware_*.h
 gateware/
+
+# inregistrari IQ (mari)
+iq_rec/
+*.wav
