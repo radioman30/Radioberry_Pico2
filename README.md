@@ -1,17 +1,35 @@
 # Radioberry_Pico2
 
 Receptor SDR HF standalone: **Radioberry v2 condus de un Raspberry Pi Pico 2**,
-fara Linux, fara retea, fara PC. OLED 1.3", encoder, doua butoane, audio pe casti.
+fara Linux, fara retea, fara PC. OLED 1.3", encoder, butoane, audio pe casti.
 
 Scopul e sa scot Pi-ul din lant. Radioberry are deja un FPGA care face toata munca
 grea (DDC, decimare); Pi-ul nu facea decat sa citeasca IQ pe SPI si sa-l impacheteze
 in UDP HPSDR pentru un PC. Partea aia o poate face un RP2350, iar restul
 demodularii incape lejer in cele doua nuclee M33.
 
-**Stare (30 sep 2026):** interfata host<->FPGA extrasa din driverul PA3GSB pentru Pi 5 (pio-mode) —
-vezi **[`PROTOCOL.md`](PROTOCOL.md)**. IQ-ul NU vine pe SPI (cum presupunea planul), ci pe 4 linii
-paralele citite de PIO. Faza 0 anterioara: Nimic nu e validat inca pe bancul propriu, dar
-**arhitectura e confirmata de un tert care a ajuns deja la ea** — vezi §6.1.
+**Stare (1 oct 2026): RECEPTORUL MERGE.** Radioberry v2 (CL025) înfipt direct într-un Waveshare
+**RP2350-PiZero**, firmware `firmware/rx_audio`: AM, LSB, USB, CW pe căști (PCM5102A), spectru și
+waterfall pe OLED-ul 128x64, encoder cu meniu, benzi cu memorie, filtre selectabile, setări salvate
+în flash. Testat pe aer (stații AM pe 31m/41m, SSB pe 40m).
+
+### Pornire rapidă (rx_audio)
+
+1. **Gateware** (nu e inclus în repo, e binar terț): descarcă `radioberry.rbf` 73.3 din
+   [Hermes-Lite2 `gateware/variants/radioberry_cl025/build`](https://github.com/softerhardware/Hermes-Lite2/tree/master/gateware/variants/radioberry_cl025/build)
+   (merge și 73.4 din [Radioberry-2.x `SBC/rpi-4/releases/dev/CL025`](https://github.com/pa3gsb/Radioberry-2.x/tree/master/SBC/rpi-4/releases/dev/CL025)),
+   apoi `python tools/make_gateware_header.py <cale>/radioberry.rbf` și copiază
+   `firmware/rb_bringup/gateware_cl025.h` în `firmware/rx_audio/`.
+2. **Compilare:** arduino-pico (core `rp2040:rp2040` 5.x), placa `waveshare_rp2350_pizero`, biblioteca U8g2.
+3. **Cablaj:** [`WIRING.md`](WIRING.md) §0.5 (header complet, PCM5102A, OLED, encoder) și §0.6 (butoane pe un pin).
+4. **Protocolul** și capcanele (bit DUPLEX, câștig RX, ordinea octeților, SPI mode 3): [`PROTOCOL.md`](PROTOCOL.md) §6.
+
+Comenzi USB (115200): `s` stare, `f<Hz>`, `m<0-3>`, `v<0-100>`, `g<-12..48>`, `w<Hz>` filtru, `k` butoane,
+`x` inversează IQ, `z<start,stop,pas kHz>` baleiaj.
+
+Restul documentului de mai jos e jurnalul de proiectare (planul inițial, deciziile, riscurile); unele
+părți sunt depășite — sursa de adevăr pentru ce merge acum sunt `rx_audio.ino`, `WIRING.md` §0.5–0.6
+și `PROTOCOL.md` §6.
 
 ---
 
