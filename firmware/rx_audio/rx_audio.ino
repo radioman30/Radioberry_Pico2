@@ -743,7 +743,11 @@ void loop1() {
     }
   }
   if (g_ui_ready) {                                   // butonul e pe DCLK: doar după configurare
-    static bool keys_init = false; if (!keys_init) { keys_detect(); keys_init = true; }
+    // detectarea rețelei RC: la pornire, apoi la 5 s cât timp nu e găsită (dacă se montează cu placa pornită)
+    static uint32_t t_det = 0; static bool keys_init = false;
+    if (!keys_init || (!g_keys_rc && gpio_get(PIN_ENC_SW) && millis() - t_det > 5000)) {
+      keys_detect(); keys_init = true; t_det = millis();
+    }
     static uint32_t t_key = 0, t_kdown = 0; static int key = K_NONE, key_prev = K_NONE, key_raw = K_NONE;
     static bool band_long = false;
     uint32_t t = millis();
@@ -815,5 +819,6 @@ void loop1() {
   if (bw >= 1000) snprintf(l, sizeof(l), "F%d.%d", bw / 1000, bw % 1000 / 100); else snprintf(l, sizeof(l), "F%d", bw);
   x = draw_item(x, 63, l, ui_sel == UI_FILT);
   if (g_fpga != 1) oled.drawStr(113, 63, "ERR");
+  else if (g_keys_rc) oled.drawStr(118, 63, "RC");   // rețeaua de butoane detectată
   oled.sendBuffer();
 }
