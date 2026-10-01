@@ -12,6 +12,7 @@
 //     Rețeaua se detectează singură la pornire; fără ea, pinul 18 rămâne buton simplu, ca înainte.
 // Setările (frecvență, mod, pas, filtre, volum, câștig, memoria benzilor) se salvează în flash la 5 s
 //     după ultima schimbare și se reîncarcă la pornire.
+// CAT: emulare Kenwood TS-2000 pe același port (comenzi cu „;”): WSJT-X, fldigi, Omni-Rig/HDSDR.
 // USB (115200): s stare | f<Hz> frecvența | m<0-4> modul (USB LSB CW AM FM) | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
@@ -450,6 +451,50 @@ static void pin_activity() {
                   (unsigned long)(hi[k] * 100 / NS), (unsigned long)tr[k], (unsigned long)(tr[k] / 2 * 1000 / (dt ? dt : 1)));
 }
 
+
+// ============================================================
+// CAT: emulare Kenwood TS-2000 (subset), pe același port ca restul comenzilor.
+// Comenzile Kenwood: 2 litere mari + parametri, terminate cu ';'. Interogare = fără parametri.
+// Doar recepție: TX/RX se acceptă și se ignoră (PTT în program: „None”/VOX).
+// ============================================================
+static volatile uint32_t g_cat_t = 0;                // ultima comandă CAT (în timpul CAT nu se scrie text)
+static bool cat_active() { return g_cat_t && millis() - g_cat_t < 15000; }
+
+static int mode_to_kw(int m) {                      // Kenwood: 1 LSB, 2 USB, 3 CW, 4 FM, 5 AM
+  switch (m) { case MODE_LSB: return 1; case MODE_USB: return 2; case MODE_CW: return 3; case MODE_FM: return 4; default: return 5; }
+}
+static int kw_to_mode(int k) {
+  switch (k) { case 1: return MODE_LSB; case 2: return MODE_USB; case 3: case 7: return MODE_CW;
+               case 4: return MODE_FM; case 5: return MODE_AM; default: return -1; }
+}
+
+static void cat_cmd(const char *c) {
+  g_cat_t = millis(); if (!g_cat_t) g_cat_t = 1;
+  char a = c[0], b = c[1]; const char *p = c + 2; size_t n = strlen(p);
+  char r[48];
+  if ((a == 'F' && (b == 'A' || b == 'B'))) {       // VFO A/B: ambele = frecvența receptorului
+    if (n) { uint32_t f = strtoul(p, nullptr, 10); if (f >= 10000 && f <= 30000000) { g_freq = f; g_freq_dirty = true; } }
+    else { snprintf(r, sizeof(r), "F%c%011lu;", b, (unsigned long)g_freq); Serial.print(r); }
+  } else if (a == 'I' && b == 'F' && !n) {          // stare: 38 de caractere, formatul TS-2000/TS-480
+    snprintf(r, sizeof(r), "IF%011lu     +0000000000%d000000 ;", (unsigned long)g_freq, mode_to_kw(g_mode));
+    Serial.print(r);
+  } else if (a == 'M' && b == 'D') {
+    if (n) { int m = kw_to_mode(atoi(p)); if (m >= 0 && m != g_mode) { g_mode = m; g_mode_dirty = true; } }
+    else { snprintf(r, sizeof(r), "MD%d;", mode_to_kw(g_mode)); Serial.print(r); }
+  } else if (a == 'I' && b == 'D') Serial.print("ID019;");
+  else if (a == 'P' && b == 'S') { if (!n) Serial.print("PS1;"); }
+  else if (a == 'A' && b == 'I') { if (!n) Serial.print("AI0;"); }
+  else if ((a == 'F' && (b == 'R' || b == 'T')) && !n) { snprintf(r, sizeof(r), "F%c0;", b); Serial.print(r); }
+  else if (a == 'F' && b == 'V' && !n) Serial.print("FV1.00;");
+  else if (a == 'K' && b == 'S' && !n) Serial.print("KS020;");   // viteza manipulatorului: Hamlib o cere la pornire
+  else if (a == 'S' && b == 'M') {                  // S-metru 0..30 (TS-2000), din dBFS: zgomot ~-110 -> 0
+    int v = (int)((g_smeter_db + 110) / 2); if (v < 0) v = 0; if (v > 30) v = 30;
+    snprintf(r, sizeof(r), "SM0%04d;", v); Serial.print(r);
+  } else if ((a == 'T' && b == 'X') || (a == 'R' && b == 'X')) { /* fără emisie */ }
+  else if (!n) Serial.print("?;");                  // interogare necunoscută
+  // setare necunoscută: Kenwood nu răspunde nimic
+}
+
 static void handle_cmd(const char *s) {
   if (s[0] == 'i') { pin_activity(); return; }
   if (s[0] == 'z') { scan_start(s + 1); return; }
@@ -550,7 +595,11 @@ void loop() {
 
   while (Serial.available()) {
     char c = Serial.read();
-    if (c == '\n' || c == '\r') { line[len] = 0; if (len) handle_cmd(line); len = 0; }
+    if (c == ';') {                                   // CAT Kenwood
+      line[len] = 0;
+      if (len >= 2 && isupper(line[0]) && isupper(line[1])) cat_cmd(line);
+      len = 0;
+    } else if (c == '\n' || c == '\r') { line[len] = 0; if (len) handle_cmd(line); len = 0; }
     else if (len < 23) line[len++] = c;
   }
 }
@@ -858,7 +907,7 @@ void loop1() {
       if (key == K_STEP) step_idx = (step_idx + 1) % 5;
       if (key == K_BAND) { t_kdown = t; band_long = false; }
       if (key_prev == K_BAND && !band_long) band_step(1);
-      if (key != K_NONE) { t_act = t; if (g_keys_rc && !g_stream) Serial.printf("tasta %s: %lu us\n", KEY_NAME[key], (unsigned long)g_key_us); }
+      if (key != K_NONE) { t_act = t; if (g_keys_rc && !g_stream && !cat_active()) Serial.printf("tasta %s: %lu us\n", KEY_NAME[key], (unsigned long)g_key_us); }
       key_prev = key;
     }
     if (key == K_BAND && !band_long && t - t_kdown > 700) { band_step(-1); band_long = true; }

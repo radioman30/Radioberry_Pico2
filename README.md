@@ -30,6 +30,9 @@ waterfall pe OLED-ul 128x64, encoder cu meniu, benzi cu memorie, filtre selectab
 demodulat fără volumul căștilor → WSJT-X, fldigi, înregistrare). IQ-ul brut se înregistrează cu
 `python tools/iq_record.py -t 60 -o iq_rec` → WAV pentru HDSDR / SDR# / SDR++.
 
+**CAT:** placa răspunde ca un **Kenwood TS-2000** pe același port COM (frecvență, mod, S-metru; fără
+emisie). În WSJT-X / fldigi: Rig = Kenwood TS-2000, portul plăcii, 115200, DTR = High, PTT = None/VOX.
+
 Comenzi USB (115200): `s` stare, `f<Hz>`, `m<0-3>`, `v<0-100>`, `g<-12..48>`, `w<Hz>` filtru, `k` butoane,
 `x` inversează IQ, `z<start,stop,pas kHz>` baleiaj.
 
