@@ -448,3 +448,11 @@ Radioberry_Pico2/
 - Wiki: <https://www.waveshare.com/wiki/RP2350-PiZero>
 - Schema: <https://files.waveshare.com/wiki/RP2350-PiZero/RP2350-PiZero.pdf>
 - Exemple PIO-USB (host) si DVI in pachetul de demo Waveshare
+
+---
+
+## Licență
+
+Codul și documentația din acest repo: **MIT** — vezi [`LICENSE`](LICENSE).
+Gateware-ul FPGA (`radioberry.rbf`) NU face parte din repo și are licența proiectelor de origine
+(Hermes-Lite2 / Radioberry-2.x, PA3GSB); se descarcă separat, vezi „Pornire rapidă".
