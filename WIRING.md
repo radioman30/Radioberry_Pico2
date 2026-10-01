@@ -71,7 +71,7 @@ lasă-l nelegat sau pune-l la 3V3, niciodată la 5V. Nu ține apăsat encoderul 
 
 **Comenzi (encoder):** rotire = schimbă parametrul evidențiat; apăsare scurtă = parametrul următor
 (FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN); apăsare lungă = înapoi la FRECV.
-Butonul **BOOT** de pe PiZero = banda următoare. Setările se salvează singure în flash.
+Butonul BOOT de pe PiZero nu are funcție în program (doar pentru flash). Setările se salvează singure în flash.
 
 ### 0.6 Butoane suplimentare pe GP24 (pin 18), fără pini noi
 

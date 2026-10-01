@@ -6,7 +6,6 @@
 //
 // UI (meniu cu un singur buton): apăsare scurtă = parametrul următor (FRECV > PAS > MOD > FILTRU > BANDA > VOL > GAIN);
 //     rotire = schimbă parametrul evidențiat; apăsare lungă sau 6 s fără atingere = înapoi la FRECV.
-// Butonul BOOT de pe PiZero = banda următoare (header-ul nu mai are pini liberi; BOOT se citește din QSPI CS).
 //     Fiecare bandă își ține minte ultima frecvență și ultimul mod.
 // 4 butoane (MOD, BANDA, FILTRU, PAS) pe același pin cu apăsarea encoderului (GP24, pin 18), fără ADC (pe
 //     header nu e niciun pin analogic): rețea RC, butonul se recunoaște după timpul de descărcare. WIRING.md §0.6.
@@ -776,14 +775,6 @@ void loop1() {
   if (ui_sel != UI_FREQ && millis() - t_act > 6000) ui_sel = UI_FREQ;
   settings_poll();
 
-  // butonul BOOT = banda următoare. Citirea oprește nucleul 0 câteva µs (FIFO-ul FPGA ține ~5 ms).
-  static uint32_t t_boot = 0; static bool boot_down = false;
-  if (g_ui_ready && millis() - t_boot >= 40) {
-    t_boot = millis();
-    bool b = BOOTSEL;
-    if (b && !boot_down) { band_step(1); t_act = t_boot; }
-    boot_down = b;
-  }
 
   // spectru: cere un bloc nou, procesează-l când e gata
   if (cap_ready) spectrum_update();
