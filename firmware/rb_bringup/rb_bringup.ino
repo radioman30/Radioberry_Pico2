@@ -115,8 +115,13 @@ static void rb_cmd(uint8_t c0, uint32_t data) {
   g_gw_minor  = rx[5];
 }
 
+// Registrul 0 (C1..C4): 48 kHz (C1[1:0]=0), 1 receptor (C4[5:3]=0), DUPLEX (C4 bit 2) = 1.
+// Fără duplex, receptorul 1 urmează frecvența TX, nu pe a lui (protocol HPSDR 1 / Hermes-Lite):
+// verificat pe placă — NCO-ul rămânea pe 0 Hz (I = DC constant, Q = 0 exact) până la o comandă TX.
+static const uint32_t RB_REG0 = 0x00000004;
+
 static void rb_configure() {
-  rb_cmd(0x00, 0x00000000);          // C0=0: 48 kHz (C1[1:0]=0), 1 receptor (C4[5:3]=0)
+  rb_cmd(0x00, RB_REG0);
   rb_cmd(0x02, g_freq_hz);           // adresa 1: frecvența TX (ținută egală cu RX)
   rb_cmd(0x04, g_freq_hz);           // adresa 2: frecvența RX1
 }
@@ -251,6 +256,79 @@ static void process_buffer(const uint32_t *w, int n) {
   g_synced = synced;
 }
 
+
+// ============================================================
+// 3b. RX clasic (protocolul Pi 4 / gateware Hermes-Lite 2 „radioberry_cl025" 73.3)
+//     RDY (BCM25) = FIFO > 256 eșantioane. Un eșantion = 6 octeți (I hi,mid,lo, Q hi,mid,lo),
+//     câte un octet pe fiecare front al ceasului RX (BCM6), pe 8 linii:
+//     bit 7..0 = BCM 23,20,19,18,16,13,12,5. Ieșirea FPGA e combinațională pe nivelul ceasului.
+//     Doar pe RP2350-PiZero (toate liniile pe header).
+// ============================================================
+#if defined(ARDUINO_WAVESHARE_RP2350_PIZERO)
+#define RB_PROTO_CLASSIC 1
+static const uint8_t CL_GP[8] = { 23, 20, 19, 18, 16, 13, 9, 15 };   // GP pt BCM 23,20,19,18,16,13,12,5
+static uint32_t cl_samples = 0, cl_blocks = 0;
+static volatile uint32_t cl_delay_ns = 0;   // pauza dupa fiecare front ('h<ns>')
+static inline void cl_wait() { if (cl_delay_ns) busy_wait_at_least_cycles((uint64_t)cl_delay_ns * 150 / 1000); }
+
+static void classic_init() {
+  gpio_init(PIN_RX_CLK); gpio_set_dir(PIN_RX_CLK, GPIO_OUT); gpio_put(PIN_RX_CLK, 0);
+  gpio_init(PIN_RX_RDY); gpio_set_dir(PIN_RX_RDY, GPIO_IN);
+  for (int i = 0; i < 8; i++) { gpio_init(CL_GP[i]); gpio_set_dir(CL_GP[i], GPIO_IN); }
+}
+
+static inline uint8_t cl_byte(uint32_t all) {
+  return (uint8_t)((((all >> 23) & 1) << 7) | (((all >> 20) & 1) << 6) | (((all >> 19) & 1) << 5) |
+                   (((all >> 18) & 1) << 4) | (((all >> 16) & 1) << 3) | (((all >> 13) & 1) << 2) |
+                   (((all >>  9) & 1) << 1) |  ((all >> 15) & 1));
+}
+
+// citește un bloc de 63 de eșantioane (ca driverul Pi 4) dacă RDY e sus
+static void classic_poll() {
+  if (!gpio_get(PIN_RX_RDY)) return;
+  for (int s = 0; s < 63; s++) {
+    uint8_t b[6];
+    for (int i = 0; i < 6; i++) {
+      gpio_put(PIN_RX_CLK, (i & 1) ? 0 : 1);
+      __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop");
+      cl_wait();
+      b[i] = cl_byte(gpio_get_all());
+    }
+    int32_t I = (int32_t)(((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8)) >> 8;
+    int32_t Q = (int32_t)(((uint32_t)b[3] << 24) | ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 8)) >> 8;
+    cnt_words += 2;
+    cnt_pairs++;
+    g_last_i = I;
+    g_last_q = Q;
+    if (g_bin_stream) {
+      usb_out[usb_n++] = (int16_t)(I >> 8);
+      usb_out[usb_n++] = (int16_t)(Q >> 8);
+      if (usb_n >= 512) { Serial.write((const uint8_t *)usb_out, sizeof(usb_out)); usb_n = 0; }
+    }
+  }
+  cl_blocks++;
+  g_synced = true;
+}
+
+// 'k': octeții bruți ai câtorva eșantioane (așteaptă RDY), ca să se vadă formatul
+static void classic_dump() {
+  uint32_t tw = millis();
+  while (!gpio_get(PIN_RX_RDY)) if (millis() - tw > 500) { Serial.println("RDY nu urca"); return; }
+  for (int s = 0; s < 8; s++) {
+    uint8_t b[6];
+    for (int i = 0; i < 6; i++) {
+      gpio_put(PIN_RX_CLK, (i & 1) ? 0 : 1);
+      __asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop");
+      cl_wait();
+      b[i] = cl_byte(gpio_get_all());
+    }
+    Serial.printf("esantion %d: %02X %02X %02X | %02X %02X %02X\n", s, b[0], b[1], b[2], b[3], b[4], b[5]);
+  }
+}
+#else
+#define RB_PROTO_CLASSIC 0
+#endif
+
 // ============================================================
 // USB: comenzi text
 // ============================================================
@@ -284,7 +362,7 @@ static void print_pins() {
 
 static void spi_probe() {
   for (int k = 0; k < 5; k++) {
-    uint8_t tx[6] = { RB_STATUS, 0x00, 0, 0, 0, 0 }, rx[6];
+    uint8_t tx[6] = { RB_STATUS, 0x00, 0, 0, 0, (uint8_t)RB_REG0 }, rx[6];
     gpio_put(PIN_SPI_CE0, 0);
     spi_write_read_blocking(RB_SPI, tx, rx, 6);
     gpio_put(PIN_SPI_CE0, 1);
@@ -396,6 +474,10 @@ static void gpio_mode_test() { Serial.println("testul g e doar pentru RP2350-PiZ
 #endif
 
 static void handle_command(const char *s) {
+#if RB_PROTO_CLASSIC
+  if (s[0] == 'k') { classic_dump(); return; }
+  if (s[0] == 'h') { cl_delay_ns = strtoul(s + 1, nullptr, 10); Serial.printf("pauza front RX: %lu ns\n", (unsigned long)cl_delay_ns); return; }
+#endif
   if (s[0] == 'g') { gpio_mode_test(); return; }
   if (s[0] == 'x') { spi_deep_probe(); return; }
   if (s[0] == 'p') { print_pins(); print_load_diag(); return; }
@@ -460,14 +542,23 @@ void setup() {
   gpio_init(PIN_SPI_CE0); gpio_set_dir(PIN_SPI_CE0, GPIO_OUT); gpio_put(PIN_SPI_CE0, 1);
   gpio_init(PIN_SPI_CE1); gpio_set_dir(PIN_SPI_CE1, GPIO_OUT); gpio_put(PIN_SPI_CE1, 1);
 
+  // Ceasul RX pe nivel jos ÎNAINTE de încărcare: gateware-ul numără separat fronturile urcătoare
+  // (up) și coborâtoare (down); un front coborâtor în plus după reset (pin flotant sus -> jos)
+  // decalează contoarele și registrul I nu se mai încarcă niciodată (octeții 3-5 rămân 0).
+  gpio_init(PIN_RX_CLK); gpio_set_dir(PIN_RX_CLK, GPIO_OUT); gpio_put(PIN_RX_CLK, 0);
   Serial.println("[1] FPGA: incarc gateware...");
   do_fpga_bringup();
   Serial.printf("[1] FPGA: stare %d (1=OK, -1=eroare: nSTATUS/CONF_DONE, 2=fara gateware)\n", g_fpga_state);
   print_pins();
   print_load_diag();
   g_freq_dirty = false;
+#if RB_PROTO_CLASSIC
+  Serial.println("[2] RX: protocol clasic Pi 4 (8 linii, gateware HL2 radioberry_cl025)");
+  classic_init();
+#else
   Serial.println("[2] RX: pornesc PIO + DMA...");
   Serial.println(rx_start() ? "[2] RX: pornit" : "[2] RX: EROARE");
+#endif
   print_status();
 }
 
@@ -475,6 +566,9 @@ void loop() {
   static uint32_t t_stat = 0, t_keepalive = 0;
   static uint8_t keep_idx = 0;
 
+#if RB_PROTO_CLASSIC
+  if (g_fpga_state == 1) classic_poll();
+#endif
   // buffere DMA pline
   for (int b = 0; b < 2; b++) {
     if (buf_ready_mask & (1u << b)) {
@@ -492,8 +586,9 @@ void loop() {
   uint32_t now = millis();
   if (now - t_keepalive >= 100 && g_fpga_state > 0) {
     t_keepalive = now;
-    if (keep_idx == 0) rb_cmd(0x00, 0x00000000); else rb_cmd(0x04, g_freq_hz);
-    keep_idx ^= 1;
+    // retrimise ciclic toate trei: reg 0 (cu duplex), TX, RX1
+    if (keep_idx == 0) rb_cmd(0x00, RB_REG0); else if (keep_idx == 1) rb_cmd(0x02, g_freq_hz); else rb_cmd(0x04, g_freq_hz);
+    keep_idx = (keep_idx + 1) % 3;
   }
 
   if (now - t_stat >= 1000) {

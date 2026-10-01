@@ -106,3 +106,32 @@ Deci: la fiecare RDY=1 host-ul generează 7 fronturi de ceas și citește 7 × 4
   (RP2350B, 48 GPIO, header Pi): Radioberry se infige direct și pinii BCM de mai sus
   se pot folosi ca atare, PIO-ul nu ține de pini ficși.
 - WIRING.md §1.1 (IQ pe SPI0) e **depășit** — de refăcut după tabelele de aici.
+
+---
+
+## 6. CE MERGE PE PLACĂ (1 oct 2026): protocolul clasic Pi 4 + gateware Hermes-Lite 2
+
+**Validat pe RP2350-PiZero + Radioberry CL025:** 48 006 perechi IQ/s, I/Q zgomot real, versiune 73.3.
+
+- **Gateware:** NU cel din `SBC/rpi-5/archive/.../CL025` (cu el FPGA-ul se configurează, dar SPI dă 0 și
+  RDY nu urcă niciodată). Cel bun e cel pe care îl instalează scriptul Pi 4:
+  `softerhardware/Hermes-Lite2/gateware/variants/radioberry_cl025/build/radioberry.rbf` (73.3).
+  Sursa RTL e publică: `Hermes-Lite2/gateware/rtl/radioberry/radioberry_core.v`.
+  Varianta PIO (4 biți + meta) are doar sursă (`variants/radioberry_pio_cl025`, `rtl/radioberry/pi-pio/`),
+  fără `.rbf` compilat — ar trebui compilată cu Quartus.
+- **SPI comenzi:** mod 3, 6 octeți = 48 biți: `[stare, C0, C1, C2, C3, C4]`; în gateware
+  `run = bit 40` (stare bit 0), `cmd_addr = C0[6:1]`, `cmd_data = C1..C4`. Răspuns:
+  `{resp, 0, 0, {0, fpgatype}, VERSION_MAJOR, VERSION_MINOR}`.
+  ⚠️ Contorul de biți al slave-ului NU se resetează la CS sus — doar cadre de exact 48 biți, prima
+  comandă abia după ieșirea din reset (~200 ms după încărcare).
+- ⚠️ **Registrul 0 trebuie să aibă DUPLEX = 1 (C4 bit 2, `cmd_data = 0x00000004`).** Altfel receptorul 1
+  folosește frecvența TX; dacă aceea nu e setată, NCO-ul rămâne la 0 Hz → I = DC constant, Q = 0 exact.
+  Comenzile se retrimit ciclic (reg 0, TX, RX1), ca firmware-ul PA3GSB.
+- **RX (clasic):** RDY = BCM25 = FIFO > 256 eșantioane. Un eșantion = 6 fronturi ale ceasului RX (BCM6),
+  un octet pe fiecare front (ieșire combinațională pe nivelul ceasului), pe 8 linii
+  bit 7..0 = BCM 23, 20, 19, 18, 16, 13, 12, 5. Ordinea octeților: **Q (eșantionul anterior) hi, mid, lo,
+  apoi I hi, mid, lo** (din `radioberry_core.v`: `tdata = qdata` după primul front, `idata` după al
+  4-lea). Ceasul RX trebuie ținut JOS de dinainte de încărcare (un front în plus după reset decalează
+  contoarele up/down). Driverul Pi 4 citește 63 de eșantioane per RDY.
+- **Pini RP2350-PiZero:** BCM 23,20,19,18,16,13,12,5 → GP 23,20,19,18,16,13,9,15; RDY GP25; CLK GP6.
+  ⚠️ BCM16 și BCM23 sunt linii de date FPGA → conflict cu pinii I2S aleși înainte pe PiZero (GP16/GP23).
