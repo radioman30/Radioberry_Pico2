@@ -12,7 +12,7 @@
 //     Rețeaua se detectează singură la pornire; fără ea, pinul 18 rămâne buton simplu, ca înainte.
 // Setările (frecvență, mod, pas, filtre, volum, câștig, memoria benzilor) se salvează în flash la 5 s
 //     după ultima schimbare și se reîncarcă la pornire.
-// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB)
+// USB (115200): s stare | f<Hz> frecvența | m<0-4> modul (USB LSB CW AM FM) | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -62,8 +62,8 @@ static const uint8_t RX_GP[8] = { 23, 20, 19, 18, 16, 13, 9, 15 };   // BCM 23,2
 // ============================================================
 // Stare partajată
 // ============================================================
-enum { MODE_USB, MODE_LSB, MODE_CW, MODE_AM, MODE_N };
-static const char *MODE_NAME[MODE_N] = { "USB", "LSB", "CW", "AM" };
+enum { MODE_USB, MODE_LSB, MODE_CW, MODE_AM, MODE_FM, MODE_N };   // FM = bandă îngustă (NBFM), 10 m / CB
+static const char *MODE_NAME[MODE_N] = { "USB", "LSB", "CW", "AM", "FM" };
 static volatile uint32_t g_freq = 7074000;
 static volatile int      g_mode = MODE_USB;
 // Radioberry dă spectrul în oglindă față de convenția I+jQ (LSB apărea ca USB): Q se neagă la intrare.
@@ -157,14 +157,15 @@ static void design_lowpass(float *h, int n, float fc, float fs) {
 static const int BW_SSB[] = { 1800, 2000, 2500, 2700 };
 static const int BW_CW[]  = { 250, 500, 1000 };
 static const int BW_AM[]  = { 6000, 8000 };
-static volatile int g_bw_idx[MODE_N] = { 2, 2, 1, 1 };     // USB/LSB 2,5 kHz, CW 500 Hz, AM 8 kHz
+static const int BW_FM[]  = { 8000, 11000 };            // NBFM: deviație ±2,5 kHz (10 m, CB)
+static volatile int g_bw_idx[MODE_N] = { 2, 2, 1, 1, 1 };  // USB/LSB 2,5 kHz, CW 500 Hz, AM 8 kHz, FM 11 kHz
 
 static int bw_count(int mode) {
-  return mode == MODE_CW ? 3 : mode == MODE_AM ? 2 : 4;
+  return mode == MODE_CW ? 3 : (mode == MODE_AM || mode == MODE_FM) ? 2 : 4;
 }
 static int bw_hz(int mode) {
   int i = g_bw_idx[mode];
-  return mode == MODE_CW ? BW_CW[i] : mode == MODE_AM ? BW_AM[i] : BW_SSB[i];
+  return mode == MODE_CW ? BW_CW[i] : mode == MODE_AM ? BW_AM[i] : mode == MODE_FM ? BW_FM[i] : BW_SSB[i];
 }
 // marginile benzii trecute, în Hz față de frecvența acordată
 static void filter_edges(int mode, float *lo, float *hi) {
@@ -173,7 +174,7 @@ static void filter_edges(int mode, float *lo, float *hi) {
     case MODE_USB: *lo = 250;         *hi = 250 + bw; break;   // SSB: de la 250 Hz în sus
     case MODE_LSB: *lo = -250 - bw;   *hi = -250;     break;
     case MODE_CW:  *lo = 700 - bw / 2; *hi = 700 + bw / 2; break;
-    default:       *lo = -bw / 2;     *hi = bw / 2;   break;   // AM
+    default:       *lo = -bw / 2;     *hi = bw / 2;   break;   // AM, FM
   }
 }
 
@@ -208,7 +209,7 @@ static bool dsp_push(float I, float Q, float *out) {
   const float *ri = &bI[bpos], *rq = &bQ[bpos];
   float yr = 0, yi = 0;
   int mode = g_mode;
-  if (mode == MODE_AM) {
+  if (mode == MODE_AM || mode == MODE_FM) {
     for (int k = 0; k < NBP; k++) { yr += hb_r[k] * ri[k]; yi += hb_r[k] * rq[k]; }
   } else {
     for (int k = 0; k < NBP; k++) { yr += hb_r[k] * ri[k] - hb_i[k] * rq[k]; yi += hb_r[k] * rq[k] + hb_i[k] * ri[k]; }
@@ -217,7 +218,16 @@ static bool dsp_push(float I, float Q, float *out) {
   sm_acc += p; if (++sm_n >= FS / 10) { g_smeter_db = 10 * log10f(sm_acc / sm_n + 1e-20f); sm_acc = 0; sm_n = 0; }
 
   float a;
-  if (mode == MODE_AM) {
+  if (mode == MODE_FM) {
+    // discriminator în cuadratură: unghiul dintre eșantionul curent și cel anterior = frecvența instantanee
+    static float pr = 0, pq = 0, de = 0;
+    float d = atan2f(yi * pr - yr * pq, yr * pr + yi * pq);
+    pr = yr; pq = yi;
+    d *= 12000.0f / (2 * (float)M_PI * 3000.0f);     // ±3 kHz deviație -> ±1
+    de += 0.41f * (d - de);                          // de-accentuare, pol la ~1 kHz
+    *out = de * 0.5f * (g_vol / 100.0f);             // FM are amplitudine constantă: fără AGC
+    return true;
+  } else if (mode == MODE_AM) {
     float env = sqrtf(p);
     a = env - dc_x + 0.995f * dc_y;                  // blocare DC
     dc_x = env; dc_y = a;
@@ -347,7 +357,7 @@ void setup() {
   settings_load();
   Serial.begin(115200);
   design_lowpass(h_dec, NDEC, 4500, FS_IN);
-  design_bandpass(g_mode); g_mode_dirty = false;
+  g_mode_dirty = true;                               // filtrele (și decimarea pt. FM) se fac în loop()
   audio_out_begin();
   radio_start();
 }
@@ -462,7 +472,12 @@ void loop() {
   if (g_fpga == 1) rx_poll();
   audio_out_pump();
 
-  if (g_mode_dirty) { g_mode_dirty = false; design_bandpass(g_mode); }
+  if (g_mode_dirty) {
+    g_mode_dirty = false;
+    static int dec_mode = -1; int fm = g_mode == MODE_FM;
+    if (fm != dec_mode) { design_lowpass(h_dec, NDEC, fm ? 5600 : 4500, FS_IN); dec_mode = fm; }
+    design_bandpass(g_mode);
+  }
   if (g_freq_dirty && g_fpga == 1) { g_freq_dirty = false; rb_cmd(0x02, g_freq); rb_cmd(0x04, g_freq); }
   if (g_gain_dirty && g_fpga == 1) { g_gain_dirty = false; rb_cmd(0x14, rb_gain_word()); }
 
@@ -510,6 +525,7 @@ static Band BANDS[] = {
   { "17m", 18068000, 18168000, 18130000, MODE_USB },
   { "15m", 21000000, 21450000, 21200000, MODE_USB },
   { "12m", 24890000, 24990000, 24940000, MODE_USB },
+  { "CB",  26965000, 27405000, 27185000, MODE_FM },
   { "10m", 28000000, 29700000, 28500000, MODE_USB },
 };
 static const int NBANDS = sizeof(BANDS) / sizeof(BANDS[0]);
@@ -554,7 +570,7 @@ struct Settings {
   uint8_t  band_mode[NBANDS];
   uint32_t sum;
 };
-static const uint32_t SET_MAGIC = 0x52425331;          // "RBS1"; schimbă-l când se schimbă structura
+static const uint32_t SET_MAGIC = 0x52425332;          // "RBS2"; schimbă-l când se schimbă structura
 static Settings set_saved;
 
 static uint32_t settings_sum(const Settings &x) {
