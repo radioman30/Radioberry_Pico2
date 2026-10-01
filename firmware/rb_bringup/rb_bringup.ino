@@ -94,7 +94,7 @@ static void rb_cmd(uint8_t c0, uint32_t data) {
                     (uint8_t)(data >> 8), (uint8_t)data };
   uint8_t rx[6];
   gpio_put(PIN_SPI_CE0, 0);
-  spi_write_read_blocking(spi0, tx, rx, 6);
+  spi_write_read_blocking(RB_SPI, tx, rx, 6);
   gpio_put(PIN_SPI_CE0, 1);
   g_gw_status = rx[0];
   g_gw_fpga   = rx[3] & 0x03;
@@ -283,8 +283,8 @@ void setup() {
   gpio_init(PIN_FPGA_NSTATUS);  gpio_set_dir(PIN_FPGA_NSTATUS, GPIO_IN);
   gpio_init(PIN_FPGA_CONFDONE); gpio_set_dir(PIN_FPGA_CONFDONE, GPIO_IN);
 
-  spi_init(spi0, 1000000);                         // 1 MHz la început (PA3GSB: 10 MHz)
-  spi_set_format(spi0, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+  spi_init(RB_SPI, 1000000);                         // 1 MHz la început (PA3GSB: 10 MHz)
+  spi_set_format(RB_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
   gpio_set_function(PIN_SPI_MISO, GPIO_FUNC_SPI);
   gpio_set_function(PIN_SPI_SCK,  GPIO_FUNC_SPI);
   gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SPI);
@@ -363,9 +363,25 @@ static bool button_pressed(int pin, uint32_t &t_last, bool &was_down) {
   return edge;
 }
 
+
+// Apăsare encoder: 1 = scurtă, 2 = lungă (>700 ms). Lunga ține locul BUTONULUI 2 pe plăcile
+// fără el (RP2350-PiZero: doar 4 pini liberi pentru UI).
+static int enc_sw_event() {
+  static bool down = false, long_sent = false;
+  static uint32_t t_down = 0;
+  bool now_down = !digitalRead(PIN_ENC_SW);
+  uint32_t t = millis();
+  int ev = 0;
+  if (now_down && !down) { t_down = t; long_sent = false; }
+  if (now_down && !long_sent && t - t_down > 700) { ev = 2; long_sent = true; }
+  if (!now_down && down && !long_sent && t - t_down > 30) ev = 1;
+  down = now_down;
+  return ev;
+}
+
 void setup1() {
   static const int UI_PINS[] = { PIN_ENC_A, PIN_ENC_B, PIN_ENC_SW, PIN_BTN1, PIN_BTN2 };
-  for (int p : UI_PINS) pinMode(p, INPUT_PULLUP);
+  for (int p : UI_PINS) if (p >= 0) pinMode(p, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), enc_isr, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), enc_isr, CHANGE);
 
@@ -376,8 +392,8 @@ void setup1() {
 }
 
 void loop1() {
-  static uint32_t t_draw = 0, t_sw = 0, t_b1 = 0, t_b2 = 0;
-  static bool sw_d = false, b1_d = false, b2_d = false;
+  static uint32_t t_draw = 0, t_b1 = 0, t_b2 = 0;
+  static bool b1_d = false, b2_d = false;
 
   int32_t d;
   noInterrupts(); d = enc_delta; enc_delta = 0; interrupts();
@@ -388,9 +404,11 @@ void loop1() {
     g_freq_hz = (uint32_t)f;
     g_freq_dirty = true;
   }
-  if (button_pressed(PIN_ENC_SW, t_sw, sw_d)) step_idx = (step_idx + 1) % 5;
+  int sw = enc_sw_event();
+  if (sw == 1) step_idx = (step_idx + 1) % 5;
   if (button_pressed(PIN_BTN1, t_b1, b1_d))   g_bin_stream = !g_bin_stream;
-  if (button_pressed(PIN_BTN2, t_b2, b2_d))   g_reload_req = true;
+  if ((PIN_BTN2 >= 0 && button_pressed(PIN_BTN2, t_b2, b2_d)) || (PIN_BTN2 < 0 && sw == 2))
+    g_reload_req = true;
 
   uint32_t now = millis();
   if (now - t_draw < 200) return;

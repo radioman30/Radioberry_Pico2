@@ -11,7 +11,7 @@
 //   5 CW           ton manipulat „VVV" în Morse, ca un semnal CW
 //   6 LINISTE      zero digital (zgomotul de fond al DAC-ului)
 // Encoder = frecvența tonului; apăsare encoder = pasul (10/100/1000 Hz);
-// BUTON 2 = volumul (-40/-30/-20/-12/-6 dB). Pornește la -30 dB: PCM5102A dă 2,1 Vrms
+// BUTON 2 = volumul (-40/-30/-20/-12/-6 dB); pe RP2350-PiZero = apăsare LUNGĂ pe encoder. Pornește la -30 dB: PCM5102A dă 2,1 Vrms
 // la maxim, prea tare direct în căști.
 //
 // USB (115200): stare o dată pe secundă + comenzi  m<n> mod, f<Hz> frecvență, v<dB> volum.
@@ -156,9 +156,25 @@ static bool pressed(int pin, uint32_t &t_last, bool &was_down) {
   return edge;
 }
 
+
+// Apăsare encoder: 1 = scurtă, 2 = lungă (>700 ms). Lunga ține locul BUTONULUI 2 pe plăcile
+// fără el (RP2350-PiZero: doar 4 pini liberi pentru UI).
+static int enc_sw_event() {
+  static bool down = false, long_sent = false;
+  static uint32_t t_down = 0;
+  bool now_down = !digitalRead(PIN_ENC_SW);
+  uint32_t t = millis();
+  int ev = 0;
+  if (now_down && !down) { t_down = t; long_sent = false; }
+  if (now_down && !long_sent && t - t_down > 700) { ev = 2; long_sent = true; }
+  if (!now_down && down && !long_sent && t - t_down > 30) ev = 1;
+  down = now_down;
+  return ev;
+}
+
 void setup1() {
   static const int UI_PINS[] = { PIN_ENC_A, PIN_ENC_B, PIN_ENC_SW, PIN_BTN1, PIN_BTN2 };
-  for (int p : UI_PINS) pinMode(p, INPUT_PULLUP);
+  for (int p : UI_PINS) if (p >= 0) pinMode(p, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), enc_isr, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), enc_isr, CHANGE);
   Wire1.setSDA(PIN_OLED_SDA);
@@ -168,8 +184,8 @@ void setup1() {
 }
 
 void loop1() {
-  static uint32_t t_draw = 0, t_sw = 0, t_b1 = 0, t_b2 = 0;
-  static bool sw_d = false, b1_d = false, b2_d = false;
+  static uint32_t t_draw = 0, t_b1 = 0, t_b2 = 0;
+  static bool b1_d = false, b2_d = false;
 
   int32_t d;
   noInterrupts(); d = enc_delta; enc_delta = 0; interrupts();
@@ -177,16 +193,18 @@ void loop1() {
     int32_t f = (int32_t)g_freq + d * (int32_t)STEPS[step_idx];
     g_freq = (uint32_t)constrain(f, 20, 20000);
   }
-  if (pressed(PIN_ENC_SW, t_sw, sw_d)) step_idx = (step_idx + 1) % 3;
+  int sw = enc_sw_event();
+  if (sw == 1) step_idx = (step_idx + 1) % 3;
   if (pressed(PIN_BTN1, t_b1, b1_d))   g_mode = (g_mode + 1) % M_COUNT;
-  if (pressed(PIN_BTN2, t_b2, b2_d))   g_vol_idx = (g_vol_idx + 1) % VOL_N;
+  if ((PIN_BTN2 >= 0 && pressed(PIN_BTN2, t_b2, b2_d)) || (PIN_BTN2 < 0 && sw == 2))
+    g_vol_idx = (g_vol_idx + 1) % VOL_N;
 
   if (millis() - t_draw < 100) return;
   t_draw = millis();
   char l[24];
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x10_tf);
-  oled.drawStr(0, 10, "TEST AUDIO PCM5102A");
+  oled.drawStr(0, 10, "TEST AUDIO " RB_BOARD_NAME);
   oled.setFont(u8g2_font_10x20_tf);
   oled.drawStr(0, 32, MODE_NAME[g_mode]);
   oled.setFont(u8g2_font_6x10_tf);
