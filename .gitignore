@@ -17,5 +17,5 @@ __pycache__/
 *.backup
 
 # gateware Radioberry (binar tert, nu se publica)
-firmware/rb_bringup/gateware_*.h
+firmware/*/gateware_*.h
 gateware/
