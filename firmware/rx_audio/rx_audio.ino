@@ -73,6 +73,8 @@ enum { K_NONE, K_SW, K_MOD, K_BAND, K_FILT, K_STEP };
 static volatile bool     g_keys_rc = false;         // rețeaua RC e montată (detectat la pornire)
 static volatile uint32_t g_keys_detect_us = 0, g_key_us = 0;
 static volatile int      g_key_last = K_NONE;
+static volatile bool     g_keys_pause = false;
+static const char *KEY_NAME[] = { "-", "ENCODER", "MOD", "BANDA", "FILTRU", "PAS" };      // diagnosticul „kd" ține nucleul 1 departe de pin
 static volatile int      g_vol = 30;                // 0..100
 static volatile int      g_gain_db = 20;            // câștig LNA AD9866: -12..+48 dB
 static volatile bool     g_gain_dirty = false;
@@ -406,11 +408,33 @@ static void handle_cmd(const char *s) {
   if (s[0] == 'z') { scan_start(s + 1); return; }
   long v = atol(s + 1);
   if (s[0] == 'f' && v >= 10000 && v <= 30000000) { g_freq = v; g_freq_dirty = true; }
+  if (s[0] == 'k' && s[1] == 'd') {                  // diagnostic rețea RC: cât durează încărcarea/descărcarea
+    g_keys_pause = true; delay(400);                  // nucleul 1 termină ce măsura și lasă pinul
+    auto rise = [](uint32_t low_ms) -> uint32_t {     // ține pinul jos low_ms, apoi pull-up: timp până citește 1
+      gpio_disable_pulls(PIN_ENC_SW);
+      gpio_put(PIN_ENC_SW, 0); gpio_set_dir(PIN_ENC_SW, GPIO_OUT); delay(low_ms);
+      gpio_set_dir(PIN_ENC_SW, GPIO_IN); gpio_pull_up(PIN_ENC_SW);
+      uint32_t t0 = time_us_32(), dt;
+      do { dt = time_us_32() - t0; } while (!gpio_get(PIN_ENC_SW) && dt < 400000);
+      return dt;
+    };
+    uint32_t up20 = rise(20), up1 = rise(1);
+    // ține pinul sus 20 ms, apoi pull-down: timp până citește 0 (fără niciun buton apăsat!)
+    gpio_disable_pulls(PIN_ENC_SW);
+    gpio_put(PIN_ENC_SW, 1); gpio_set_dir(PIN_ENC_SW, GPIO_OUT); delay(20);
+    gpio_set_dir(PIN_ENC_SW, GPIO_IN); gpio_pull_down(PIN_ENC_SW);
+    uint32_t t0 = time_us_32(), dn;
+    do { dn = time_us_32() - t0; } while (gpio_get(PIN_ENC_SW) && dn < 400000);
+    gpio_disable_pulls(PIN_ENC_SW); gpio_pull_up(PIN_ENC_SW);
+    g_keys_pause = false;
+    Serial.printf("kd: urcare dupa 20 ms jos = %lu us | dupa 1 ms jos = %lu us | coborare cu pull-down = %lu us\n",
+                  (unsigned long)up20, (unsigned long)up1, (unsigned long)dn);
+    return;
+  }
   if (s[0] == 'k') {
-    static const char *KN[] = { "-", "ENCODER", "MOD", "BANDA", "FILTRU", "PAS" };
     Serial.printf("butoane: %s (urcare la detectie %lu us) | ultima masurare %lu us -> %s\n",
                   g_keys_rc ? "retea RC" : "doar encoder", (unsigned long)g_keys_detect_us,
-                  (unsigned long)g_key_us, KN[g_key_last]);
+                  (unsigned long)g_key_us, KEY_NAME[g_key_last]);
     return;
   }
   if (s[0] == 'x') { g_iq_inv = !g_iq_inv; Serial.printf("IQ %s\n", g_iq_inv ? "inversat" : "normal"); return; }
@@ -597,7 +621,9 @@ void setup1() {
 // cât durează până scade sub prag (calculat pt. prag 1,0..1,6 V):
 //   SW ~0 | 1k 0,34-0,81 ms | 2k2 1,17-2,20 ms | 4k7 2,95-5,16 ms | 10k 6,8-11,5 ms
 // Limitele dintre ferestre sunt la mijloc (geometric); comanda USB „k" arată timpul măsurat.
-static const uint32_t KEY_LIM_US[] = { 100, 1000, 2600, 6000, 16000 };   // SW | MOD | BANDA | FILTRU | PAS
+// Măsurat pe placă (2 oct 2026, cu un pull-up de ~10k rămas pe nod): SW 0 | MOD 600-860 | BANDA 2275-3050 µs.
+// Limitele = medii geometrice între grupuri, cu marjă ≥1,6x; FILTRU/PAS nemăsurate (încă nemontate).
+static const uint32_t KEY_LIM_US[] = { 100, 1500, 5000, 10000, 20000 };  // SW | MOD | BANDA | FILTRU | PAS
 static const int      KEY_OF[]     = { K_SW, K_MOD, K_BAND, K_FILT, K_STEP };
 
 static void keys_detect() {
@@ -744,6 +770,7 @@ void loop1() {
   if (g_ui_ready) {                                   // butonul e pe DCLK: doar după configurare
     // detectarea rețelei RC: la pornire, apoi la 5 s cât timp nu e găsită (dacă se montează cu placa pornită)
     static uint32_t t_det = 0; static bool keys_init = false;
+    if (g_keys_pause) return;
     if (!keys_init || (!g_keys_rc && gpio_get(PIN_ENC_SW) && millis() - t_det > 5000)) {
       keys_detect(); keys_init = true; t_det = millis();
     }
@@ -762,7 +789,7 @@ void loop1() {
       if (key == K_STEP) step_idx = (step_idx + 1) % 5;
       if (key == K_BAND) { t_kdown = t; band_long = false; }
       if (key_prev == K_BAND && !band_long) band_step(1);
-      if (key != K_NONE) t_act = t;
+      if (key != K_NONE) { t_act = t; if (g_keys_rc) Serial.printf("tasta %s: %lu us\n", KEY_NAME[key], (unsigned long)g_key_us); }
       key_prev = key;
     }
     if (key == K_BAND && !band_long && t - t_kdown > 700) { band_step(-1); band_long = true; }

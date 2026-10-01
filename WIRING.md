@@ -101,6 +101,11 @@ Totul stă pe firul existent al encoderului SW.
 
 Rezistoare de 1 % dacă ai; de 5 % merg. Un singur buton apăsat odată.
 
+⚠️ **Module de butoane / encoder cu pull-up:** multe module au un rezistor de 10 kΩ spre „+" (VCC).
+Pe nod, acesta reîncarcă condensatorul și strică măsurarea (pe banc, cu două module alimentate, toate
+butoanele erau văzute ca encoder). **Scoate rezistorul de 10 kΩ sau lasă „+" al modulului nelegat.**
+Timpi măsurați pe banc (cu încă un pull-up de 10 kΩ rămas pe nod): MOD 600–860 µs, BANDA 2275–3050 µs.
+
 **Detectare automată:** la pornire, firmware-ul măsoară cât urcă pinul. Dacă găsește condensatorul,
 pornește modul cu butoane. Altfel pinul rămâne buton simplu, ca înainte, deci nu se comandă niciodată
 un SW legat direct la GND. Nu ține niciun buton apăsat la pornire.
