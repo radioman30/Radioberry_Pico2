@@ -14,6 +14,66 @@ rezolva in favoarea fisierului, dupa verificare pe placa.
 
 ---
 
+### 0.5 Header complet — RP2350-PiZero + Radioberry înfipt + firmware `rx_audio` (gateware 73.3)  ← CABLAJUL ACTUAL
+
+Sursa: netlist-ul Radioberry (`hardware/radio/Radioberry.net`, CN302 ↔ FPGA U1) + schema Waveshare.
+**„Radioberry"** = pinul e folosit de placa radio, nu lega nimic acolo. **„NU LEGA"** = ieșire a FPGA-ului.
+
+| Pin | BCM | GP | Folosit de | Tu legi aici |
+|---|---|---|---|---|
+| 1 | 3V3 | — | alimentare | PCM5102A **VIN**, OLED **VCC** |
+| 2 | 5V | — | alimentare Radioberry | — |
+| 3 | 2 | 2 | — | OLED **SDA** |
+| 4 | 5V | — | alimentare Radioberry | — |
+| 5 | 3 | 3 | — | OLED **SCL** |
+| 6 | GND | — | masă | GND PCM5102A |
+| 7 | 4 | 14 | (intrare FPGA nefolosită) | PCM5102A **DIN** |
+| 8 | 14 | 4 | — | PCM5102A **BCK** |
+| 9 | GND | — | masă | GND OLED |
+| 10 | 15 | 5 | — | PCM5102A **LCK** |
+| 11 | 17 | 17 | FPGA `pi_cwl` (ieșire) | **NU LEGA** |
+| 12 | 18 | 18 | Radioberry: date RX bit 4 | — |
+| 13 | 27 | 27 | Radioberry: nCONFIG | — |
+| 14 | GND | — | masă | comun encoder |
+| 15 | 22 | 22 | Radioberry: CONF_DONE | — |
+| 16 | 23 | 23 | Radioberry: date RX bit 7 | — |
+| 17 | 3V3 | — | alimentare | — |
+| 18 | 24 | 24 | Radioberry: DCLK (doar la încărcare) | encoder **SW** (apăsarea) |
+| 19 | 10 | 11 | Radioberry: SPI MOSI | — |
+| 20 | GND | — | masă | — |
+| 21 | 9 | 12 | Radioberry: SPI MISO | — |
+| 22 | 25 | 25 | Radioberry: RDY (eșantioane gata) | — |
+| 23 | 11 | 10 | Radioberry: SPI SCLK | — |
+| 24 | 8 | 8 | Radioberry: SPI CE0 | — |
+| 25 | GND | — | masă | — |
+| 26 | 7 | 7 | Radioberry: SPI CE1 | — |
+| 27 | 0 | 0 | — | encoder **A** (CLK) |
+| 28 | 1 | 1 | — | encoder **B** (DT) |
+| 29 | 5 | 15 | Radioberry: date RX bit 0 | — |
+| 30 | GND | — | masă | — |
+| 31 | 6 | 6 | Radioberry: ceas RX | — |
+| 32 | 12 | 9 | Radioberry: date RX bit 1 | — |
+| 33 | 13 | 13 | Radioberry: DATA0 / date RX bit 2 | — |
+| 34 | GND | — | masă | — |
+| 35 | 19 | 19 | Radioberry: date RX bit 5 | — |
+| 36 | 16 | 16 | Radioberry: date RX bit 3 | — |
+| 37 | 26 | 26 | Radioberry: nSTATUS | — |
+| 38 | 20 | 20 | Radioberry: date RX bit 6 | — |
+| 39 | GND | — | masă | — |
+| 40 | 21 | 21 | FPGA `pi_cwr` (ieșire) | **NU LEGA** |
+
+**Pe modulul PCM5102A:** SCK → GND, XSMT → 3V3, FLT / DEMP / FMT → GND (jumperii de pe spate).
+Căștile intră în mufa jack a modulului.
+
+**Encoder:** pull-up intern, contactele spre GND (comunul la pinul 14). Dacă modulul are pin „+",
+lasă-l nelegat sau pune-l la 3V3, niciodată la 5V. Nu ține apăsat encoderul când pornești placa
+(pinul 18 servește întâi la încărcarea FPGA-ului).
+
+**Comenzi:** rotire = acord; apăsare scurtă = pasul (10 Hz…100 kHz); apăsare lungă = modul
+(USB → LSB → CW → AM). Volumul: comanda USB `v<0-100>` (implicit 30).
+
+---
+
 ## 0. Harta de pini v2 — Pico 2 ↔ Radioberry (1 oct 2026)  ← SURSA DE ADEVĂR
 
 Refăcută după protocolul real (`PROTOCOL.md`): IQ-ul vine pe 4 linii paralele citite de PIO,
