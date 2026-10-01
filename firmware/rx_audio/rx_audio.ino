@@ -8,7 +8,7 @@
 //     rotire = schimbă parametrul evidențiat; apăsare lungă sau 6 s fără atingere = înapoi la FRECV.
 // Butonul BOOT de pe PiZero = banda următoare (header-ul nu mai are pini liberi; BOOT se citește din QSPI CS).
 //     Fiecare bandă își ține minte ultima frecvență și ultimul mod.
-// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB
+// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB | x inversează IQ (LSB<->USB)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -60,6 +60,8 @@ enum { MODE_USB, MODE_LSB, MODE_CW, MODE_AM, MODE_N };
 static const char *MODE_NAME[MODE_N] = { "USB", "LSB", "CW", "AM" };
 static volatile uint32_t g_freq = 7074000;
 static volatile int      g_mode = MODE_USB;
+// Radioberry dă spectrul în oglindă față de convenția I+jQ (LSB apărea ca USB): Q se neagă la intrare.
+static volatile bool     g_iq_inv = true;
 static volatile int      g_vol = 30;                // 0..100
 static volatile int      g_gain_db = 20;            // câștig LNA AD9866: -12..+48 dB
 static volatile bool     g_gain_dirty = false;
@@ -266,7 +268,7 @@ static void rx_poll() {
     // cadrul n aduce Q[n-1] și I[n]: perechea corectă e (I din cadrul anterior, Q din cadrul curent).
     // O decalare I/Q de un eșantion strică suprimarea benzii laterale opuse la SSB.
     float out;
-    float fi = prev_i / 8388608.0f, fq = q / 8388608.0f;
+    float fi = prev_i / 8388608.0f, fq = (g_iq_inv ? -q : q) / 8388608.0f;
     if (dsp_push(fi, fq, &out)) audio_out_push(out);
     if (cap_req) {
       cap_i[cap_n] = fi; cap_q[cap_n] = fq;
@@ -370,6 +372,7 @@ static void handle_cmd(const char *s) {
   if (s[0] == 'z') { scan_start(s + 1); return; }
   long v = atol(s + 1);
   if (s[0] == 'f' && v >= 10000 && v <= 30000000) { g_freq = v; g_freq_dirty = true; }
+  if (s[0] == 'x') { g_iq_inv = !g_iq_inv; Serial.printf("IQ %s\n", g_iq_inv ? "inversat" : "normal"); return; }
   if (s[0] == 'm' && v >= 0 && v < MODE_N)        { g_mode = v; g_mode_dirty = true; }
   if (s[0] == 'v' && v >= 0 && v <= 100)          g_vol = v;
   if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; g_gain_dirty = true; }
