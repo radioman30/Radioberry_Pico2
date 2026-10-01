@@ -4,11 +4,11 @@
 //       -> decimare /4 (12 kHz) -> filtru complex trece-bandă -> demodulare -> AGC -> I2S 12 kHz.
 // Protocol și capcane: PROTOCOL.md §6. Doar pe RP2350-PiZero (Radioberry înfipt în header).
 //
-// UI (meniu cu un singur buton): apăsare scurtă = parametrul următor (FRECV > PAS > MOD > BANDA > VOL > GAIN);
+// UI (meniu cu un singur buton): apăsare scurtă = parametrul următor (FRECV > PAS > MOD > FILTRU > BANDA > VOL > GAIN);
 //     rotire = schimbă parametrul evidențiat; apăsare lungă sau 6 s fără atingere = înapoi la FRECV.
 // Butonul BOOT de pe PiZero = banda următoare (header-ul nu mai are pini liberi; BOOT se citește din QSPI CS).
 //     Fiecare bandă își ține minte ultima frecvență și ultimul mod.
-// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB | x inversează IQ (LSB<->USB)
+// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -140,15 +140,35 @@ static void design_lowpass(float *h, int n, float fc, float fs) {
   for (int k = 0; k < n; k++) h[k] /= sum;
 }
 
+// Lățimea filtrului, aleasă separat pentru fiecare mod (meniul FILTRU sau comanda w<Hz>).
+static const int BW_SSB[] = { 1800, 2000, 2500, 2700 };
+static const int BW_CW[]  = { 250, 500, 1000 };
+static const int BW_AM[]  = { 6000, 8000 };
+static volatile int g_bw_idx[MODE_N] = { 2, 2, 1, 1 };     // USB/LSB 2,5 kHz, CW 500 Hz, AM 8 kHz
+
+static int bw_count(int mode) {
+  return mode == MODE_CW ? 3 : mode == MODE_AM ? 2 : 4;
+}
+static int bw_hz(int mode) {
+  int i = g_bw_idx[mode];
+  return mode == MODE_CW ? BW_CW[i] : mode == MODE_AM ? BW_AM[i] : BW_SSB[i];
+}
+// marginile benzii trecute, în Hz față de frecvența acordată
+static void filter_edges(int mode, float *lo, float *hi) {
+  float bw = bw_hz(mode);
+  switch (mode) {
+    case MODE_USB: *lo = 250;         *hi = 250 + bw; break;   // SSB: de la 250 Hz în sus
+    case MODE_LSB: *lo = -250 - bw;   *hi = -250;     break;
+    case MODE_CW:  *lo = 700 - bw / 2; *hi = 700 + bw / 2; break;
+    default:       *lo = -bw / 2;     *hi = bw / 2;   break;   // AM
+  }
+}
+
 // filtru complex: trece-jos de lățime bw/2 mutat la f0 (f0<0 = banda de jos, pt. LSB)
 static void design_bandpass(int mode) {
-  float f0, half;
-  switch (mode) {
-    case MODE_USB: f0 =  1550; half = 1300; break;  // 250..2850 Hz
-    case MODE_LSB: f0 = -1550; half = 1300; break;
-    case MODE_CW:  f0 =   700; half =  250; break;  // 450..950 Hz
-    default:       f0 =     0; half = 4000; break;  // AM ±4 kHz
-  }
+  float lo, hi;
+  filter_edges(mode, &lo, &hi);
+  float f0 = (lo + hi) / 2, half = (hi - lo) / 2;
   static float h[NBP];
   design_lowpass(h, NBP, half, FS);
   for (int k = 0; k < NBP; k++) {
@@ -373,6 +393,15 @@ static void handle_cmd(const char *s) {
   long v = atol(s + 1);
   if (s[0] == 'f' && v >= 10000 && v <= 30000000) { g_freq = v; g_freq_dirty = true; }
   if (s[0] == 'x') { g_iq_inv = !g_iq_inv; Serial.printf("IQ %s\n", g_iq_inv ? "inversat" : "normal"); return; }
+  if (s[0] == 'w' && v > 0) {
+    int m = g_mode, best = 0, bd = 1 << 30;
+    for (int k = 0; k < bw_count(m); k++) {
+      g_bw_idx[m] = k; int dk = abs(bw_hz(m) - v);
+      if (dk < bd) { bd = dk; best = k; }
+    }
+    g_bw_idx[m] = best; g_mode_dirty = true;
+    Serial.printf("filtru %s: %d Hz\n", MODE_NAME[m], bw_hz(m)); return;
+  }
   if (s[0] == 'm' && v >= 0 && v < MODE_N)        { g_mode = v; g_mode_dirty = true; }
   if (s[0] == 'v' && v >= 0 && v <= 100)          g_vol = v;
   if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; g_gain_dirty = true; }
@@ -478,7 +507,7 @@ void setup1() {
   oled.begin();
 }
 
-enum { UI_FREQ, UI_STEP, UI_MODE, UI_BAND, UI_VOL, UI_GAIN, UI_N };
+enum { UI_FREQ, UI_STEP, UI_MODE, UI_FILT, UI_BAND, UI_VOL, UI_GAIN, UI_N };
 static int ui_sel = UI_FREQ;
 
 // ---------------- spectru + waterfall ----------------
@@ -554,12 +583,7 @@ static void spectrum_draw() {
   // marcaj frecvență acordată + banda filtrului (375 Hz/coloană)
   for (int y = SP_Y0; y < SP_Y0 + SP_H; y += 3) oled.drawPixel(64, y);
   float lo, hi;
-  switch (g_mode) {
-    case MODE_USB: lo = 250; hi = 2850; break;
-    case MODE_LSB: lo = -2850; hi = -250; break;
-    case MODE_CW:  lo = 450; hi = 950; break;
-    default:       lo = -4000; hi = 4000; break;
-  }
+  filter_edges(g_mode, &lo, &hi);
   int x0 = 64 + (int)floorf(lo / 375.0f), x1 = 64 + (int)ceilf(hi / 375.0f);
   oled.drawHLine(x0, SP_Y0, x1 - x0 + 1);
   // waterfall cu dithering ordonat (monocrom)
@@ -595,6 +619,7 @@ void loop1() {
       }
       case UI_STEP: step_idx = constrain(step_idx + (int)d, 0, 4); break;
       case UI_MODE: g_mode = ((g_mode + (int)d) % MODE_N + MODE_N) % MODE_N; g_mode_dirty = true; break;
+      case UI_FILT: { int m = g_mode; g_bw_idx[m] = constrain(g_bw_idx[m] + (int)d, 0, bw_count(m) - 1); g_mode_dirty = true; break; }
       case UI_BAND: band_step(d > 0 ? 1 : -1); break;
       case UI_VOL:  g_vol = constrain(g_vol + 2 * (int)d, 0, 100); break;
       case UI_GAIN: g_gain_db = constrain(g_gain_db + (int)d, -12, 48); g_gain_dirty = true; break;
@@ -648,7 +673,9 @@ void loop1() {
   x = draw_item(x + 1, 63, l, ui_sel == UI_STEP);
   snprintf(l, sizeof(l), "V%d", g_vol);           x = draw_item(x, 63, l, ui_sel == UI_VOL);
   snprintf(l, sizeof(l), "G%+d", g_gain_db);      x = draw_item(x, 63, l, ui_sel == UI_GAIN);
-  if (g_fpga != 1) oled.drawStr(100, 63, "ERR");
-  else oled.drawStr(98, 63, "-24 +24");
+  int bw = bw_hz(g_mode);
+  if (bw >= 1000) snprintf(l, sizeof(l), "F%d.%d", bw / 1000, bw % 1000 / 100); else snprintf(l, sizeof(l), "F%d", bw);
+  x = draw_item(x, 63, l, ui_sel == UI_FILT);
+  if (g_fpga != 1) oled.drawStr(113, 63, "ERR");
   oled.sendBuffer();
 }
