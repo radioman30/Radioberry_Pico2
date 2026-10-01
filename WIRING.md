@@ -69,8 +69,46 @@ Căștile intră în mufa jack a modulului.
 lasă-l nelegat sau pune-l la 3V3, niciodată la 5V. Nu ține apăsat encoderul când pornești placa
 (pinul 18 servește întâi la încărcarea FPGA-ului).
 
-**Comenzi:** rotire = acord; apăsare scurtă = pasul (10 Hz…100 kHz); apăsare lungă = modul
-(USB → LSB → CW → AM). Volumul: comanda USB `v<0-100>` (implicit 30).
+**Comenzi (encoder):** rotire = schimbă parametrul evidențiat; apăsare scurtă = parametrul următor
+(FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN); apăsare lungă = înapoi la FRECV.
+Butonul **BOOT** de pe PiZero = banda următoare. Setările se salvează singure în flash.
+
+### 0.6 Butoane suplimentare pe GP24 (pin 18), fără pini noi
+
+Pe header nu există niciun pin analogic (ADC-ul RP2350B e doar pe GP40–47), deci butoanele nu se citesc
+ca tensiune, ci după **cât durează descărcarea unui condensator** prin rezistența fiecărui buton.
+Totul stă pe firul existent al encoderului SW.
+
+```
+ pin 18 (GP24) ──[ 470 Ω ]──┬──────────┬──────────┬──────────┬──────────┬──────────┐
+                            │          │          │          │          │          │
+                          1 µF     encoder SW    MOD       BANDA     FILTRU      PAS
+                            │          │          │          │          │          │
+                            │          │       [1 kΩ]   [2,2 kΩ]   [4,7 kΩ]   [10 kΩ]
+                            │          │          │          │          │          │
+ GND ───────────────────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+```
+
+| Piesă | Valoare | Observații |
+|---|---|---|
+| rezistor serie (pin 18 → nod) | **470 Ω** | obligatoriu: izolează condensatorul de DCLK la încărcarea FPGA |
+| condensator nod → GND | **1 µF** ceramic X7R (sau tantal) | NU Y5V/Z5U (variază −80 %) |
+| encoder SW | direct, fără rezistor | firul SW se mută de pe pinul 18 pe nod (după 470 Ω) |
+| MOD | 1 kΩ | modul următor (USB → LSB → CW → AM) |
+| BANDA | 2,2 kΩ | scurt = banda următoare, lung (>0,7 s) = banda anterioară |
+| FILTRU | 4,7 kΩ | lățimea următoare a filtrului pentru modul curent |
+| PAS | 10 kΩ | pasul următor (10 Hz … 100 kHz) |
+
+Rezistoare de 1 % dacă ai; de 5 % merg. Un singur buton apăsat odată.
+
+**Detectare automată:** la pornire, firmware-ul măsoară cât urcă pinul. Dacă găsește condensatorul,
+pornește modul cu butoane. Altfel pinul rămâne buton simplu, ca înainte, deci nu se comandă niciodată
+un SW legat direct la GND. Nu ține niciun buton apăsat la pornire.
+
+**Verificare:** comanda USB `k` afișează modul detectat și timpul măsurat la ultima apăsare. Ferestrele
+(calculate pentru un prag de 1,0–1,6 V): SW < 0,1 ms · MOD 0,34–0,81 ms · BANDA 1,2–2,2 ms ·
+FILTRU 3,0–5,2 ms · PAS 6,8–11,5 ms. Dacă un buton e recunoscut greșit, trimite-mi timpii din `k`
+și ajustez limitele (`KEY_LIM_US` în `rx_audio.ino`).
 
 ---
 

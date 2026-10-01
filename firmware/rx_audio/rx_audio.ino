@@ -8,9 +8,12 @@
 //     rotire = schimbă parametrul evidențiat; apăsare lungă sau 6 s fără atingere = înapoi la FRECV.
 // Butonul BOOT de pe PiZero = banda următoare (header-ul nu mai are pini liberi; BOOT se citește din QSPI CS).
 //     Fiecare bandă își ține minte ultima frecvență și ultimul mod.
+// 4 butoane (MOD, BANDA, FILTRU, PAS) pe același pin cu apăsarea encoderului (GP24, pin 18), fără ADC (pe
+//     header nu e niciun pin analogic): rețea RC, butonul se recunoaște după timpul de descărcare. WIRING.md §0.6.
+//     Rețeaua se detectează singură la pornire; fără ea, pinul 18 rămâne buton simplu, ca înainte.
 // Setările (frecvență, mod, pas, filtre, volum, câștig, memoria benzilor) se salvează în flash la 5 s
 //     după ultima schimbare și se reîncarcă la pornire.
-// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB)
+// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -66,6 +69,11 @@ static volatile uint32_t g_freq = 7074000;
 static volatile int      g_mode = MODE_USB;
 // Radioberry dă spectrul în oglindă față de convenția I+jQ (LSB apărea ca USB): Q se neagă la intrare.
 static volatile bool     g_iq_inv = true;
+// butoane pe pinul 18 (vezi keys_read)
+enum { K_NONE, K_SW, K_MOD, K_BAND, K_FILT, K_STEP };
+static volatile bool     g_keys_rc = false;         // rețeaua RC e montată (detectat la pornire)
+static volatile uint32_t g_keys_detect_us = 0, g_key_us = 0;
+static volatile int      g_key_last = K_NONE;
 static volatile int      g_vol = 30;                // 0..100
 static volatile int      g_gain_db = 20;            // câștig LNA AD9866: -12..+48 dB
 static volatile bool     g_gain_dirty = false;
@@ -399,6 +407,13 @@ static void handle_cmd(const char *s) {
   if (s[0] == 'z') { scan_start(s + 1); return; }
   long v = atol(s + 1);
   if (s[0] == 'f' && v >= 10000 && v <= 30000000) { g_freq = v; g_freq_dirty = true; }
+  if (s[0] == 'k') {
+    static const char *KN[] = { "-", "ENCODER", "MOD", "BANDA", "FILTRU", "PAS" };
+    Serial.printf("butoane: %s (urcare la detectie %lu us) | ultima masurare %lu us -> %s\n",
+                  g_keys_rc ? "retea RC" : "doar encoder", (unsigned long)g_keys_detect_us,
+                  (unsigned long)g_key_us, KN[g_key_last]);
+    return;
+  }
   if (s[0] == 'x') { g_iq_inv = !g_iq_inv; Serial.printf("IQ %s\n", g_iq_inv ? "inversat" : "normal"); return; }
   if (s[0] == 'w' && v > 0) {
     int m = g_mode, best = 0, bd = 1 << 30;
@@ -575,6 +590,40 @@ void setup1() {
   oled.begin();
 }
 
+// ---------------- butoane pe un singur pin (GP24 = pin 18 = DCLK, după configurarea FPGA) ----------------
+// pin 18 ── 470 Ω ── N ;  N ── 1 µF ── GND ;  N ── encoder SW ── GND (direct)
+//   N ── MOD ── 1 kΩ ── GND ;  N ── BANDA ── 2,2 kΩ ── GND ;  N ── FILTRU ── 4,7 kΩ ── GND ;  N ── PAS ── 10 kΩ ── GND
+// 470 Ω izolează condensatorul: la încărcarea FPGA, DCLK comută rapid și nu vede 1 µF.
+// Repaus: pull-up-ul intern ține N sus. Apăsat: pinul citește 0 -> se încarcă C prin 470 Ω, apoi se măsoară
+// cât durează până scade sub prag (calculat pt. prag 1,0..1,6 V):
+//   SW ~0 | 1k 0,34-0,81 ms | 2k2 1,17-2,20 ms | 4k7 2,95-5,16 ms | 10k 6,8-11,5 ms
+// Limitele dintre ferestre sunt la mijloc (geometric); comanda USB „k" arată timpul măsurat.
+static const uint32_t KEY_LIM_US[] = { 100, 1000, 2600, 6000, 16000 };   // SW | MOD | BANDA | FILTRU | PAS
+static const int      KEY_OF[]     = { K_SW, K_MOD, K_BAND, K_FILT, K_STEP };
+
+static void keys_detect() {
+  // descarcă C, apoi lasă pull-up-ul (~50 kΩ) să-l încarce: cu 1 µF durează ~50 ms, fără C câteva µs
+  gpio_put(PIN_ENC_SW, 0); gpio_set_dir(PIN_ENC_SW, GPIO_OUT); delay(20);
+  gpio_set_dir(PIN_ENC_SW, GPIO_IN); gpio_pull_up(PIN_ENC_SW);
+  uint32_t t0 = time_us_32(), dt;
+  do { dt = time_us_32() - t0; } while (!gpio_get(PIN_ENC_SW) && dt < 300000);
+  g_keys_detect_us = dt;
+  g_keys_rc = dt > 2000 && dt < 300000;      // ținut apăsat la pornire (nu urcă deloc) = mod simplu, sigur
+}
+
+static int keys_read() {
+  if (gpio_get(PIN_ENC_SW)) return K_NONE;               // nimic apăsat
+  if (!g_keys_rc) return K_SW;                           // fără rețea: nu se comandă pinul (SW e direct la GND)
+  gpio_put(PIN_ENC_SW, 1); gpio_set_dir(PIN_ENC_SW, GPIO_OUT);
+  delayMicroseconds(3000);                               // încarcă C prin 470 Ω (τ ≤ 0,47 ms)
+  gpio_set_dir(PIN_ENC_SW, GPIO_IN);
+  uint32_t t0 = time_us_32(), dt;
+  do { dt = time_us_32() - t0; } while (gpio_get(PIN_ENC_SW) && dt < KEY_LIM_US[4]);
+  g_key_us = dt;
+  for (int k = 0; k < 5; k++) if (dt < KEY_LIM_US[k]) return KEY_OF[k];
+  return K_NONE;                                         // eliberat chiar în timpul măsurării
+}
+
 enum { UI_FREQ, UI_STEP, UI_MODE, UI_FILT, UI_BAND, UI_VOL, UI_GAIN, UI_N };
 static int ui_sel = UI_FREQ;
 
@@ -694,7 +743,27 @@ void loop1() {
     }
   }
   if (g_ui_ready) {                                   // butonul e pe DCLK: doar după configurare
-    bool now_down = !gpio_get(PIN_ENC_SW); uint32_t t = millis();
+    static bool keys_init = false; if (!keys_init) { keys_detect(); keys_init = true; }
+    static uint32_t t_key = 0, t_kdown = 0; static int key = K_NONE, key_prev = K_NONE, key_raw = K_NONE;
+    static bool band_long = false;
+    uint32_t t = millis();
+    if (t - t_key >= 25) {                            // două citiri identice la rând = apăsare stabilă
+      t_key = t;
+      int k = keys_read();
+      if (k == key_raw) key = k;
+      key_raw = k; g_key_last = k;
+    }
+    if (key != key_prev) {                            // MOD/FILTRU/PAS la apăsare; BANDA la eliberare (lung = înapoi)
+      if (key == K_MOD)  { g_mode = (g_mode + 1) % MODE_N; g_mode_dirty = true; }
+      if (key == K_FILT) { int m = g_mode; g_bw_idx[m] = (g_bw_idx[m] + 1) % bw_count(m); g_mode_dirty = true; }
+      if (key == K_STEP) step_idx = (step_idx + 1) % 5;
+      if (key == K_BAND) { t_kdown = t; band_long = false; }
+      if (key_prev == K_BAND && !band_long) band_step(1);
+      if (key != K_NONE) t_act = t;
+      key_prev = key;
+    }
+    if (key == K_BAND && !band_long && t - t_kdown > 700) { band_step(-1); band_long = true; }
+    bool now_down = key == K_SW;
     if (now_down && !down) { t_down = t; long_done = false; }
     if (now_down && !long_done && t - t_down > 700) { ui_sel = UI_FREQ; long_done = true; t_act = t; }
     if (!now_down && down && !long_done && t - t_down > 30) { ui_sel = (ui_sel + 1) % UI_N; t_act = t; }
