@@ -4,7 +4,8 @@
 //       -> decimare /4 (12 kHz) -> filtru complex trece-bandă -> demodulare -> AGC -> I2S 12 kHz.
 // Protocol și capcane: PROTOCOL.md §6. Doar pe RP2350-PiZero (Radioberry înfipt în header).
 //
-// UI: encoder = acord; apăsare scurtă = pasul (10 Hz..100 kHz); apăsare lungă = modul (USB/LSB/CW/AM).
+// UI (meniu cu un singur buton): apăsare scurtă = parametrul următor (FRECV > PAS > MOD > VOL > GAIN);
+//     rotire = schimbă parametrul evidențiat; apăsare lungă sau 6 s fără atingere = înapoi la FRECV.
 // USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
@@ -59,6 +60,7 @@ static volatile uint32_t g_freq = 7074000;
 static volatile int      g_mode = MODE_USB;
 static volatile int      g_vol = 30;                // 0..100
 static volatile int      g_gain_db = 20;            // câștig LNA AD9866: -12..+48 dB
+static volatile bool     g_gain_dirty = false;
 static volatile bool     g_freq_dirty = true, g_mode_dirty = true;
 static volatile int      g_fpga = 0;                // 1 = OK
 static volatile uint8_t  g_gw_major = 0, g_gw_minor = 0;
@@ -195,24 +197,33 @@ static bool dsp_push(float I, float Q, float *out) {
 }
 
 // ============================================================
-// Ieșire audio (PCM5102A, I2S 12 kHz). De înlocuit aici pentru CM108AH.
+// Ieșire audio (PCM5102A, I2S 48 kHz). De înlocuit aici pentru CM108AH.
+// Demodulatorul dă 12 kHz; ieșirea e la 48 kHz (interpolare liniară ×4), ca în audio_test validat:
+// cu SCK la GND, PCM5102A își face ceasul din BCK prin PLL, iar la 12 kHz (BCK 384 kHz) nu e sigur
+// că se sincronizează — pe placă, la 12 kHz se auzea doar zgomot și cu volumul pe 0.
 // ============================================================
+static const int FS_OUT = 48000, UPS = FS_OUT / FS;
 static I2S i2s(OUTPUT);
-#define AQ 1024
+#define AQ 4096
 static int16_t aq[AQ]; static int aq_w = 0, aq_r = 0;
+static float up_prev = 0;
 
 static void audio_out_begin() {
   i2s.setBCLK(PIN_I2S_BCK);
   i2s.setDATA(PIN_I2S_DATA);
   i2s.setBitsPerSample(16);
-  i2s.setBuffers(8, 64);
-  i2s.begin(FS);
+  i2s.setBuffers(8, 256);
+  i2s.begin(FS_OUT);
 }
 static void audio_out_push(float x) {
   if (x > 1) x = 1; if (x < -1) x = -1;
   int n = (aq_w - aq_r + AQ) % AQ;
-  if (n >= AQ - 1) { g_audio_drop++; return; }      // ceasul FPGA > ceasul I2S: aruncă
-  aq[aq_w] = (int16_t)(x * 32000); aq_w = (aq_w + 1) % AQ;
+  if (n >= AQ - UPS) { g_audio_drop++; up_prev = x; return; }   // ceasul FPGA > ceasul I2S: aruncă
+  for (int k = 1; k <= UPS; k++) {
+    float y = up_prev + (x - up_prev) * k / UPS;
+    aq[aq_w] = (int16_t)(y * 32000); aq_w = (aq_w + 1) % AQ;
+  }
+  up_prev = x;
 }
 static void audio_out_pump() {
   while (aq_r != aq_w && i2s.availableForWrite() >= 4) {
@@ -290,12 +301,65 @@ void setup() {
   radio_start();
 }
 
+// Baleiaj de diagnostic: pentru fiecare frecvență așteaptă 2 măsurători de S (2 × 100 ms) și le notează.
+static volatile bool scan_on = false;
+static uint32_t scan_f, scan_stop, scan_step, scan_t; static int scan_saved_mode;
+static float scan_min = 0, scan_max = -200; static uint32_t scan_fmax = 0;
+
+static void scan_start(const char *a) {
+  long st = 5800, sp = 10000, ps = 10;
+  sscanf(a, "%ld,%ld,%ld", &st, &sp, &ps);
+  scan_f = st * 1000; scan_stop = sp * 1000; scan_step = ps * 1000;
+  scan_saved_mode = g_mode; g_mode = MODE_AM; g_mode_dirty = true;
+  g_freq = scan_f; g_freq_dirty = true;
+  scan_min = 0; scan_max = -200; scan_t = millis(); scan_on = true;
+  Serial.printf("baleiaj %ld..%ld kHz pas %ld kHz, castig %+d dB (AM +-4 kHz)\n", st, sp, ps, g_gain_db);
+}
+
+static void scan_tick() {
+  if (!scan_on || millis() - scan_t < 220) return;
+  float sdb = g_smeter_db;
+  if (sdb < scan_min) scan_min = sdb;
+  if (sdb > scan_max) { scan_max = sdb; scan_fmax = scan_f; }
+  Serial.printf("%7.3f MHz  %6.1f dBFS\n", scan_f / 1e6, sdb);
+  scan_f += scan_step;
+  if (scan_f > scan_stop) {
+    scan_on = false;
+    Serial.printf("gata: minim %.1f dBFS, maxim %.1f dBFS la %.3f MHz (diferenta %.1f dB)\n",
+                  scan_min, scan_max, scan_fmax / 1e6, scan_max - scan_min);
+    g_mode = scan_saved_mode; g_mode_dirty = true;
+    return;
+  }
+  g_freq = scan_f; g_freq_dirty = true; scan_t = millis();
+}
+
+// 'i': ce se întâmplă efectiv pe pinii audio (nivelul citit din pad, deci și dacă sunt în scurt)
+static void pin_activity() {
+  const int P[3] = { PIN_I2S_BCK, PIN_I2S_LRCK, PIN_I2S_DATA };
+  const char *N[3] = { "BCK  (hdr 8)", "LCK  (hdr 10)", "DIN  (hdr 7)" };
+  uint32_t hi[3] = { 0 }, tr[3] = { 0 }; int last[3];
+  for (int k = 0; k < 3; k++) last[k] = gpio_get(P[k]);
+  const int NS = 100000;
+  uint32_t t0 = micros();
+  for (int n = 0; n < NS; n++) {
+    uint32_t a = gpio_get_all();
+    for (int k = 0; k < 3; k++) { int v = (a >> P[k]) & 1; hi[k] += v; if (v != last[k]) { tr[k]++; last[k] = v; } }
+  }
+  uint32_t dt = micros() - t0;
+  Serial.printf("activitate pini audio (%d citiri in %lu us):\n", NS, (unsigned long)dt);
+  for (int k = 0; k < 3; k++)
+    Serial.printf("  %s GP%d: sus %3lu%%  comutari %lu  (~%lu kHz)\n", N[k], P[k],
+                  (unsigned long)(hi[k] * 100 / NS), (unsigned long)tr[k], (unsigned long)(tr[k] / 2 * 1000 / (dt ? dt : 1)));
+}
+
 static void handle_cmd(const char *s) {
+  if (s[0] == 'i') { pin_activity(); return; }
+  if (s[0] == 'z') { scan_start(s + 1); return; }
   long v = atol(s + 1);
   if (s[0] == 'f' && v >= 10000 && v <= 30000000) { g_freq = v; g_freq_dirty = true; }
   if (s[0] == 'm' && v >= 0 && v < MODE_N)        { g_mode = v; g_mode_dirty = true; }
   if (s[0] == 'v' && v >= 0 && v <= 100)          g_vol = v;
-  if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; if (g_fpga == 1) rb_cmd(0x14, rb_gain_word()); }
+  if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; g_gain_dirty = true; }
   Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s | S %.1f dBFS | drop %lu under %lu\n",
                 g_fpga == 1 ? "OK" : "ERR", g_gw_major, g_gw_minor, (unsigned long)g_freq, MODE_NAME[g_mode],
                 g_vol, g_gain_db, (unsigned long)g_iq_rate, g_smeter_db, (unsigned long)g_audio_drop, (unsigned long)g_audio_under);
@@ -310,6 +374,7 @@ void loop() {
 
   if (g_mode_dirty) { g_mode_dirty = false; design_bandpass(g_mode); }
   if (g_freq_dirty && g_fpga == 1) { g_freq_dirty = false; rb_cmd(0x02, g_freq); rb_cmd(0x04, g_freq); }
+  if (g_gain_dirty && g_fpga == 1) { g_gain_dirty = false; rb_cmd(0x14, rb_gain_word()); }
 
   uint32_t now = millis();
   if (g_fpga == 1 && now - t_keep >= 100) {          // comenzi retrimise ciclic: reg0, TX, RX1, câștig
@@ -323,6 +388,7 @@ void loop() {
     keep = (keep + 1) % 4;
   }
   if (now - t_rate >= 1000) { t_rate = now; g_iq_rate = cnt_iq; cnt_iq = 0; }
+  scan_tick();
 
   while (Serial.available()) {
     char c = Serial.read();
@@ -357,24 +423,47 @@ void setup1() {
   oled.begin();
 }
 
+enum { UI_FREQ, UI_STEP, UI_MODE, UI_VOL, UI_GAIN, UI_N };
+static int ui_sel = UI_FREQ;
+
+// text cu fundal inversat când e selectat
+static void draw_item(int x, int y, const char *txt, bool sel) {
+  if (sel) {
+    oled.drawBox(x - 1, y - 9, (int)strlen(txt) * 6 + 2, 11);
+    oled.setDrawColor(0); oled.drawStr(x, y, txt); oled.setDrawColor(1);
+  } else {
+    oled.drawStr(x, y, txt);
+  }
+}
+
 void loop1() {
-  static uint32_t t_draw = 0, t_down = 0; static bool down = false, long_done = false;
+  static uint32_t t_draw = 0, t_down = 0, t_act = 0; static bool down = false, long_done = false;
 
   int32_t d; noInterrupts(); d = enc_delta; enc_delta = 0; interrupts();
   if (d) {
-    int64_t f = (int64_t)g_freq + (int64_t)d * STEPS[step_idx];
-    if (f < 10000) f = 10000; if (f > 30000000) f = 30000000;
-    g_freq = (uint32_t)f; g_freq_dirty = true;
+    t_act = millis();
+    switch (ui_sel) {
+      case UI_FREQ: {
+        int64_t f = (int64_t)g_freq + (int64_t)d * STEPS[step_idx];
+        if (f < 10000) f = 10000; if (f > 30000000) f = 30000000;
+        g_freq = (uint32_t)f; g_freq_dirty = true; break;
+      }
+      case UI_STEP: step_idx = constrain(step_idx + (int)d, 0, 4); break;
+      case UI_MODE: g_mode = ((g_mode + (int)d) % MODE_N + MODE_N) % MODE_N; g_mode_dirty = true; break;
+      case UI_VOL:  g_vol = constrain(g_vol + 2 * (int)d, 0, 100); break;
+      case UI_GAIN: g_gain_db = constrain(g_gain_db + (int)d, -12, 48); g_gain_dirty = true; break;
+    }
   }
   if (g_ui_ready) {                                   // butonul e pe DCLK: doar după configurare
     bool now_down = !gpio_get(PIN_ENC_SW); uint32_t t = millis();
     if (now_down && !down) { t_down = t; long_done = false; }
-    if (now_down && !long_done && t - t_down > 700) { g_mode = (g_mode + 1) % MODE_N; g_mode_dirty = true; long_done = true; }
-    if (!now_down && down && !long_done && t - t_down > 30) step_idx = (step_idx + 1) % 5;
+    if (now_down && !long_done && t - t_down > 700) { ui_sel = UI_FREQ; long_done = true; t_act = t; }
+    if (!now_down && down && !long_done && t - t_down > 30) { ui_sel = (ui_sel + 1) % UI_N; t_act = t; }
     down = now_down;
   }
+  if (ui_sel != UI_FREQ && millis() - t_act > 6000) ui_sel = UI_FREQ;
 
-  if (millis() - t_draw < 120) return;
+  if (millis() - t_draw < 100) return;
   t_draw = millis();
   char l[24];
   uint32_t f = g_freq;
@@ -383,14 +472,23 @@ void loop1() {
   snprintf(l, sizeof(l), "%2lu.%03lu.%02lu", (unsigned long)(f / 1000000), (unsigned long)(f / 1000 % 1000),
            (unsigned long)(f % 1000 / 10));
   oled.drawStr(0, 18, l);
+  if (ui_sel == UI_FREQ) oled.drawHLine(0, 20, 100);   // frecvența e cea acordată de encoder
   oled.setFont(u8g2_font_6x10_tf);
-  snprintf(l, sizeof(l), "%s  pas %lu", MODE_NAME[g_mode], (unsigned long)STEPS[step_idx]);
-  oled.drawStr(0, 32, l);
+
+  snprintf(l, sizeof(l), "%s", MODE_NAME[g_mode]);                draw_item(0, 33, l, ui_sel == UI_MODE);
+  uint32_t st = STEPS[step_idx];
+  if (st >= 1000) snprintf(l, sizeof(l), "%luk", (unsigned long)(st / 1000)); else snprintf(l, sizeof(l), "%lu", (unsigned long)st);
+  draw_item(30, 33, l, ui_sel == UI_STEP);
+  snprintf(l, sizeof(l), "V%d", g_vol);                           draw_item(62, 33, l, ui_sel == UI_VOL);
+  snprintf(l, sizeof(l), "G%+d", g_gain_db);                      draw_item(96, 33, l, ui_sel == UI_GAIN);
+
   // S-metru: -130..-40 dBFS pe 100 px
-  float s = g_smeter_db; int w = (int)((s + 130) * 100 / 90); if (w < 0) w = 0; if (w > 100) w = 100;
-  oled.drawFrame(0, 38, 102, 8); oled.drawBox(1, 39, w, 6);
-  snprintf(l, sizeof(l), "%4.0f", s); oled.drawStr(104, 46, l);
-  snprintf(l, sizeof(l), "%s G%+d vol%d", g_fpga == 1 ? "RB" : "ERR", g_gain_db, g_vol);
-  oled.drawStr(0, 60, l);
+  float sm = g_smeter_db; int w = (int)((sm + 130) * 100 / 90); if (w < 0) w = 0; if (w > 100) w = 100;
+  oled.drawFrame(0, 40, 102, 8); oled.drawBox(1, 41, w, 6);
+  snprintf(l, sizeof(l), "%4.0f", sm); oled.drawStr(104, 48, l);
+
+  static const char *SEL_NAME[UI_N] = { "acord", "pas", "mod", "volum", "castig" };
+  snprintf(l, sizeof(l), "%s  > %s", g_fpga == 1 ? "RB" : "ERR", SEL_NAME[ui_sel]);
+  oled.drawStr(0, 62, l);
   oled.sendBuffer();
 }
