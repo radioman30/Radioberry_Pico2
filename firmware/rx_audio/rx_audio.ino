@@ -5,7 +5,7 @@
 // Protocol și capcane: PROTOCOL.md §6. Doar pe RP2350-PiZero (Radioberry înfipt în header).
 //
 // UI: encoder = acord; apăsare scurtă = pasul (10 Hz..100 kHz); apăsare lungă = modul (USB/LSB/CW/AM).
-// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul
+// USB (115200): s stare | f<Hz> frecvența | m<0-3> modul | v<0-100> volumul | g<-12..48> câștig RX dB
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -58,6 +58,7 @@ static const char *MODE_NAME[MODE_N] = { "USB", "LSB", "CW", "AM" };
 static volatile uint32_t g_freq = 7074000;
 static volatile int      g_mode = MODE_USB;
 static volatile int      g_vol = 30;                // 0..100
+static volatile int      g_gain_db = 20;            // câștig LNA AD9866: -12..+48 dB
 static volatile bool     g_freq_dirty = true, g_mode_dirty = true;
 static volatile int      g_fpga = 0;                // 1 = OK
 static volatile uint8_t  g_gw_major = 0, g_gw_minor = 0;
@@ -99,6 +100,9 @@ static int fpga_load() {
 // SPI control: mod 3, 6 octeți [stare, C0, C1..C4]; răspuns: [4].[5] = versiune
 // ============================================================
 static const uint32_t RB_REG0 = 0x00000004;         // 48 kHz, 1 RX, DUPLEX=1 (altfel RX1 = frecv. TX)
+// Câștig RX: adresa 0x0A (C0 = 0x14), cmd_data[6:0] = 0x40 | (dB + 12). La pornire gateware-ul e pe
+// 0x40 = -12 dB (minimul) -> fără comanda asta receptorul e practic surd (ad9866ctrl.v).
+static inline uint32_t rb_gain_word() { return 0x40u | (uint32_t)(g_gain_db + 12); }
 static void rb_cmd(uint8_t c0, uint32_t data) {
   uint8_t tx[6] = { 0x05, c0, (uint8_t)(data >> 24), (uint8_t)(data >> 16), (uint8_t)(data >> 8), (uint8_t)data }, rx[6];
   gpio_put(PIN_SPI_CE0, 0);
@@ -273,7 +277,7 @@ static void radio_start() {
   g_fpga = fpga_load();
   if (g_fpga == 1) {
     delay(200);                                      // ieșirea din reset înainte de primul cadru SPI
-    rb_cmd(0x00, RB_REG0); rb_cmd(0x02, g_freq); rb_cmd(0x04, g_freq);
+    rb_cmd(0x00, RB_REG0); rb_cmd(0x02, g_freq); rb_cmd(0x04, g_freq); rb_cmd(0x14, rb_gain_word());
   }
   g_ui_ready = true;
 }
@@ -291,9 +295,10 @@ static void handle_cmd(const char *s) {
   if (s[0] == 'f' && v >= 10000 && v <= 30000000) { g_freq = v; g_freq_dirty = true; }
   if (s[0] == 'm' && v >= 0 && v < MODE_N)        { g_mode = v; g_mode_dirty = true; }
   if (s[0] == 'v' && v >= 0 && v <= 100)          g_vol = v;
-  Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d | IQ %lu/s | S %.1f dBFS | drop %lu under %lu\n",
+  if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; if (g_fpga == 1) rb_cmd(0x14, rb_gain_word()); }
+  Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s | S %.1f dBFS | drop %lu under %lu\n",
                 g_fpga == 1 ? "OK" : "ERR", g_gw_major, g_gw_minor, (unsigned long)g_freq, MODE_NAME[g_mode],
-                g_vol, (unsigned long)g_iq_rate, g_smeter_db, (unsigned long)g_audio_drop, (unsigned long)g_audio_under);
+                g_vol, g_gain_db, (unsigned long)g_iq_rate, g_smeter_db, (unsigned long)g_audio_drop, (unsigned long)g_audio_under);
 }
 
 void loop() {
@@ -307,10 +312,15 @@ void loop() {
   if (g_freq_dirty && g_fpga == 1) { g_freq_dirty = false; rb_cmd(0x02, g_freq); rb_cmd(0x04, g_freq); }
 
   uint32_t now = millis();
-  if (g_fpga == 1 && now - t_keep >= 100) {          // comenzi retrimise ciclic: reg0, TX, RX1
+  if (g_fpga == 1 && now - t_keep >= 100) {          // comenzi retrimise ciclic: reg0, TX, RX1, câștig
     t_keep = now;
-    if (keep == 0) rb_cmd(0x00, RB_REG0); else if (keep == 1) rb_cmd(0x02, g_freq); else rb_cmd(0x04, g_freq);
-    keep = (keep + 1) % 3;
+    switch (keep) {
+      case 0: rb_cmd(0x00, RB_REG0); break;
+      case 1: rb_cmd(0x02, g_freq); break;
+      case 2: rb_cmd(0x04, g_freq); break;
+      default: rb_cmd(0x14, rb_gain_word()); break;
+    }
+    keep = (keep + 1) % 4;
   }
   if (now - t_rate >= 1000) { t_rate = now; g_iq_rate = cnt_iq; cnt_iq = 0; }
 
@@ -380,7 +390,7 @@ void loop1() {
   float s = g_smeter_db; int w = (int)((s + 130) * 100 / 90); if (w < 0) w = 0; if (w > 100) w = 100;
   oled.drawFrame(0, 38, 102, 8); oled.drawBox(1, 39, w, 6);
   snprintf(l, sizeof(l), "%4.0f", s); oled.drawStr(104, 46, l);
-  snprintf(l, sizeof(l), "%s gw%u.%u vol%d", g_fpga == 1 ? "RB" : "ERR", g_gw_major, g_gw_minor, g_vol);
+  snprintf(l, sizeof(l), "%s G%+d vol%d", g_fpga == 1 ? "RB" : "ERR", g_gain_db, g_vol);
   oled.drawStr(0, 60, l);
   oled.sendBuffer();
 }

@@ -126,7 +126,10 @@ Deci: la fiecare RDY=1 host-ul generează 7 fronturi de ceas și citește 7 × 4
   comandă abia după ieșirea din reset (~200 ms după încărcare).
 - ⚠️ **Registrul 0 trebuie să aibă DUPLEX = 1 (C4 bit 2, `cmd_data = 0x00000004`).** Altfel receptorul 1
   folosește frecvența TX; dacă aceea nu e setată, NCO-ul rămâne la 0 Hz → I = DC constant, Q = 0 exact.
-  Comenzile se retrimit ciclic (reg 0, TX, RX1), ca firmware-ul PA3GSB.
+  Comenzile se retrimit ciclic (reg 0, TX, RX1, câștig), ca firmware-ul PA3GSB.
+- ⚠️ **Câștigul RX (LNA AD9866): adresa 0x0A (C0 = 0x14), `cmd_data[6:0] = 0x40 | (dB + 12)`, -12..+48 dB.**
+  La pornire gateware-ul e pe 0x40 = **-12 dB** (minimul) → fără comandă receptorul e practic surd.
+  Măsurat: -12 dB → -109,5 dBFS; 0 → -95; +20 → -76; +36 → -62,6 (zgomot de antenă dominant).
 - **RX (clasic):** RDY = BCM25 = FIFO > 256 eșantioane. Un eșantion = 6 fronturi ale ceasului RX (BCM6),
   un octet pe fiecare front (ieșire combinațională pe nivelul ceasului), pe 8 linii
   bit 7..0 = BCM 23, 20, 19, 18, 16, 13, 12, 5. Ordinea octeților: **Q (eșantionul anterior) hi, mid, lo,
