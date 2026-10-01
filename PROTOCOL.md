@@ -47,6 +47,8 @@ Bit-bang-ul se poate face și cu PIO (mult mai rapid decât 1 µs/bit).
 | MISO | 9 |
 | MOSI | 10 |
 
+**Mod SPI 3 (CPOL=1, CPHA=1), max 48 MHz** — din `radioberry.dts` (`spi-mode = <3>`); confirmat pe
+placă: în modul 0 gateware-ul răspunde doar cu zerouri.
 Transfer full-duplex simplu (`rb2_trx_control(tx, rx, cnt)` = un `spi_sync`). Formatul mesajelor
 (frecvență, câștig, filtre etc.) e în codul de firmware al driverului — **de extras** (pasul următor).
 

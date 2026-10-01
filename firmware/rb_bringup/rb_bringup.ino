@@ -55,6 +55,12 @@ static inline void dclk_pulse() {
   __asm volatile("nop\nnop\nnop\nnop");
 }
 
+// Diagnostic de încărcare, afișat de comanda 'p' și la pornire. Pull-up-urile host-ului fac ca
+// nSTATUS/CONF_DONE să citească 1 și fără FPGA; un FPGA alimentat le trage însă la 0 cât timp
+// nCONFIG=0 — asta e testul care nu poate fi păcălit.
+static int  dg_nstatus_low = -1, dg_confdone_low = -1, dg_confdone_before = -1, dg_confdone_after = -1;
+static uint32_t dg_nstatus_rise_us = 0;
+
 static int fpga_load() {
 #if !HAVE_GATEWARE
   return 2;
@@ -63,11 +69,15 @@ static int fpga_load() {
   gpio_put(PIN_FPGA_DATA0, 0);
   gpio_put(PIN_FPGA_DCLK, 0);
   delay(10);
+  dg_nstatus_low  = gpio_get(PIN_FPGA_NSTATUS);    // așteptat 0
+  dg_confdone_low = gpio_get(PIN_FPGA_CONFDONE);   // așteptat 0
   gpio_put(PIN_FPGA_NCONFIG, 1);
-  uint32_t t0 = millis();
+  uint32_t t0 = micros();
   while (!gpio_get(PIN_FPGA_NSTATUS)) {
-    if (millis() - t0 > 2000) return -1;          // nSTATUS n-a urcat
+    if (micros() - t0 > 2000000) return -1;       // nSTATUS n-a urcat
   }
+  dg_nstatus_rise_us = micros() - t0;
+  dg_confdone_before = gpio_get(PIN_FPGA_CONFDONE); // așteptat 0 (încă neconfigurat)
   for (uint32_t n = 0; n < GATEWARE_LEN; n++) {
     uint8_t b = GATEWARE[n];
     for (int i = 0; i < 8; i++) {
@@ -75,7 +85,9 @@ static int fpga_load() {
       dclk_pulse();
     }
   }
+  dg_confdone_after = gpio_get(PIN_FPGA_CONFDONE);  // așteptat 1
   if (!gpio_get(PIN_FPGA_NSTATUS) || !gpio_get(PIN_FPGA_CONFDONE)) return -1;
+  if (dg_nstatus_low != 0 || dg_confdone_before != 0) return -2;   // nimeni nu trage liniile: FPGA absent/nealimentat
   dclk_pulse();                                    // 2 pulsuri de inițializare
   dclk_pulse();
   return 1;
@@ -167,10 +179,11 @@ static bool rx_start() {
 
   pio_gpio_init(rx_pio, PIN_RX_CLK);
   pio_sm_set_consecutive_pindirs(rx_pio, rx_sm, PIN_RX_CLK, 1, true);
-  for (int p = PIN_RX_D0; p <= PIN_RX_D3; p++) pio_gpio_init(rx_pio, p);
+  for (int p = PIN_RX_D0; p <= PIN_RX_D3; p++) { pio_gpio_init(rx_pio, p); gpio_pull_up(p); }
   pio_sm_set_consecutive_pindirs(rx_pio, rx_sm, PIN_RX_D0, 4, false);
   gpio_init(PIN_RX_RDY);
   gpio_set_dir(PIN_RX_RDY, GPIO_IN);
+  gpio_pull_up(PIN_RX_RDY);                        // tot ca la PA3GSB
 
   pio_sm_init(rx_pio, rx_sm, rx_off, &c);
 
@@ -247,11 +260,108 @@ static void print_status() {
   static const char *FPGA_STATE[] = { "neincarcat", "OK", "fara gateware" };
   int st = g_fpga_state;
   Serial.printf("FPGA: %s | gateware %u.%u tip %u stare 0x%02X | RX %lu Hz | div %lu\n",
-                st < 0 ? "EROARE" : FPGA_STATE[st], g_gw_major, g_gw_minor, g_gw_fpga,
+                st == -2 ? "NU RASPUNDE (alimentare/conectare?)" : st < 0 ? "EROARE" : FPGA_STATE[st],
+                g_gw_major, g_gw_minor, g_gw_fpga,
                 g_gw_status, (unsigned long)g_freq_hz, (unsigned long)g_rx_clkdiv);
 }
 
+static void print_load_diag() {
+  Serial.printf("incarcare: cu nCONFIG=0 -> nSTATUS=%d CONF_DONE=%d (asteptat 0 0) | "
+                "nSTATUS urca dupa %lu us | CONF_DONE inainte=%d dupa=%d (asteptat 0 -> 1)\n",
+                dg_nstatus_low, dg_confdone_low, (unsigned long)dg_nstatus_rise_us,
+                dg_confdone_before, dg_confdone_after);
+  if (dg_nstatus_low == 1 && dg_confdone_low == 1)
+    Serial.println("  => liniile NU coboara: FPGA nealimentat / neconectat / alti pini");
+}
+
+static void print_pins() {
+  Serial.printf("pini: nSTATUS=%d CONF_DONE=%d nCONFIG=%d | RDY=%d D3..D0=%d%d%d%d | MISO=%d\n",
+                gpio_get(PIN_FPGA_NSTATUS), gpio_get(PIN_FPGA_CONFDONE), gpio_get(PIN_FPGA_NCONFIG),
+                gpio_get(PIN_RX_RDY), gpio_get(PIN_RX_D3), gpio_get(PIN_RX_D2), gpio_get(PIN_RX_D1),
+                gpio_get(PIN_RX_D0), gpio_get(PIN_SPI_MISO));
+}
+
+static void spi_probe() {
+  for (int k = 0; k < 5; k++) {
+    uint8_t tx[6] = { RB_STATUS, 0x00, 0, 0, 0, 0 }, rx[6];
+    gpio_put(PIN_SPI_CE0, 0);
+    spi_write_read_blocking(RB_SPI, tx, rx, 6);
+    gpio_put(PIN_SPI_CE0, 1);
+    Serial.printf("SPI %d: %02X %02X %02X %02X %02X %02X\n", k, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
+    delay(20);
+  }
+}
+
+static void dump_words() {
+  // copie din bufferul DMA curent (instantaneu, fără sincronizare - doar pentru inspecție)
+  Serial.print("cuvinte RX (meta|esantion): ");
+  for (int k = 0; k < 16; k++) {
+    uint32_t v = dma_buf[0][k];
+    Serial.printf("%X|%06lX ", (unsigned)((v >> 24) & 0xF), (unsigned long)(v & 0xFFFFFF));
+  }
+  Serial.println();
+}
+
+// Test SPI amănunțit: 4 moduri × 2 viteze pe perifericul hardware, apoi bit-bang mod 3,
+// cu MISO pe pull-up ca să se vadă dacă FPGA-ul comandă linia deloc.
+static uint8_t bb_xfer_mode3(uint8_t out) {
+  uint8_t in = 0;
+  for (int i = 7; i >= 0; i--) {
+    gpio_put(PIN_SPI_SCK, 0);                       // mod 3: front coborâtor = scriere
+    gpio_put(PIN_SPI_MOSI, (out >> i) & 1);
+    delayMicroseconds(5);
+    gpio_put(PIN_SPI_SCK, 1);                       // front urcător = citire
+    delayMicroseconds(5);
+    in = (in << 1) | gpio_get(PIN_SPI_MISO);
+  }
+  return in;
+}
+
+static void spi_deep_probe() {
+  gpio_pull_up(PIN_SPI_MISO);
+  delay(2);
+  Serial.printf("MISO cu CS sus (pull-up): %d\n", gpio_get(PIN_SPI_MISO));
+  gpio_put(PIN_SPI_CE0, 0); delay(2);
+  Serial.printf("MISO cu CS jos (pull-up): %d\n", gpio_get(PIN_SPI_MISO));
+  gpio_put(PIN_SPI_CE0, 1);
+
+  static const spi_cpol_t POL[4] = { SPI_CPOL_0, SPI_CPOL_0, SPI_CPOL_1, SPI_CPOL_1 };
+  static const spi_cpha_t PHA[4] = { SPI_CPHA_0, SPI_CPHA_1, SPI_CPHA_0, SPI_CPHA_1 };
+  static const uint32_t HZ[2] = { 100000, 4000000 };
+  for (int m = 0; m < 4; m++) for (int h = 0; h < 2; h++) {
+    spi_set_baudrate(RB_SPI, HZ[h]);
+    spi_set_format(RB_SPI, 8, POL[m], PHA[m], SPI_MSB_FIRST);
+    uint8_t tx[6] = { RB_STATUS, 0x00, 0, 0, 0, 0 }, rx[6];
+    gpio_put(PIN_SPI_CE0, 0);
+    spi_write_read_blocking(RB_SPI, tx, rx, 6);
+    gpio_put(PIN_SPI_CE0, 1);
+    Serial.printf("hw mod %d %7lu Hz: %02X %02X %02X %02X %02X %02X\n", m, (unsigned long)HZ[h],
+                  rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
+    delay(5);
+  }
+  // bit-bang mod 3
+  gpio_set_function(PIN_SPI_SCK, GPIO_FUNC_SIO);  gpio_set_dir(PIN_SPI_SCK, GPIO_OUT);  gpio_put(PIN_SPI_SCK, 1);
+  gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SIO); gpio_set_dir(PIN_SPI_MOSI, GPIO_OUT);
+  gpio_set_function(PIN_SPI_MISO, GPIO_FUNC_SIO); gpio_set_dir(PIN_SPI_MISO, GPIO_IN);
+  uint8_t tx[6] = { RB_STATUS, 0x00, 0, 0, 0, 0 }, rx[6];
+  gpio_put(PIN_SPI_CE0, 0); delayMicroseconds(10);
+  for (int k = 0; k < 6; k++) rx[k] = bb_xfer_mode3(tx[k]);
+  gpio_put(PIN_SPI_SCK, 1); delayMicroseconds(10);
+  gpio_put(PIN_SPI_CE0, 1);
+  Serial.printf("bit-bang mod 3:      %02X %02X %02X %02X %02X %02X\n", rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
+  // înapoi la perifericul hardware, mod 3, 1 MHz
+  gpio_set_function(PIN_SPI_MISO, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_SPI_SCK,  GPIO_FUNC_SPI);
+  gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SPI);
+  spi_set_baudrate(RB_SPI, 1000000);
+  spi_set_format(RB_SPI, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
+}
+
 static void handle_command(const char *s) {
+  if (s[0] == 'x') { spi_deep_probe(); return; }
+  if (s[0] == 'p') { print_pins(); print_load_diag(); return; }
+  if (s[0] == 'w') { dump_words(); return; }
+  if (s[0] == 'v') { spi_probe(); return; }
   if (s[0] == 'f') { g_freq_hz = strtoul(s + 1, nullptr, 10); g_freq_dirty = true; }
   else if (s[0] == 'b') { g_bin_stream = !g_bin_stream; usb_n = 0; }
   else if (s[0] == 'r') { g_reload_req = true; }
@@ -290,11 +400,14 @@ void setup() {
   gpio_init(PIN_FPGA_NCONFIG);  gpio_set_dir(PIN_FPGA_NCONFIG, GPIO_OUT); gpio_put(PIN_FPGA_NCONFIG, 1);
   gpio_init(PIN_FPGA_DATA0);    gpio_set_dir(PIN_FPGA_DATA0, GPIO_OUT);
   gpio_init(PIN_FPGA_DCLK);     gpio_set_dir(PIN_FPGA_DCLK, GPIO_OUT);
-  gpio_init(PIN_FPGA_NSTATUS);  gpio_set_dir(PIN_FPGA_NSTATUS, GPIO_IN);  gpio_pull_down(PIN_FPGA_NSTATUS);
-  gpio_init(PIN_FPGA_CONFDONE); gpio_set_dir(PIN_FPGA_CONFDONE, GPIO_IN); gpio_pull_down(PIN_FPGA_CONFDONE);
+  // pull-up ca în driverul PA3GSB (pad 0xC8 = intrare + pull-up pe RP1): nSTATUS și CONF_DONE
+  // sunt open-drain la FPGA, iar Radioberry se bazează pe pull-up-ul host-ului
+  gpio_init(PIN_FPGA_NSTATUS);  gpio_set_dir(PIN_FPGA_NSTATUS, GPIO_IN);  gpio_pull_up(PIN_FPGA_NSTATUS);
+  gpio_init(PIN_FPGA_CONFDONE); gpio_set_dir(PIN_FPGA_CONFDONE, GPIO_IN); gpio_pull_up(PIN_FPGA_CONFDONE);
 
   spi_init(RB_SPI, 1000000);                         // 1 MHz la început (PA3GSB: 10 MHz)
-  spi_set_format(RB_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+  // mod SPI 3 (CPOL=1, CPHA=1) — din radioberry.dts al PA3GSB (spi-mode = <3>, max 48 MHz)
+  spi_set_format(RB_SPI, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
   gpio_set_function(PIN_SPI_MISO, GPIO_FUNC_SPI);
   gpio_set_function(PIN_SPI_SCK,  GPIO_FUNC_SPI);
   gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SPI);
@@ -304,6 +417,8 @@ void setup() {
   Serial.println("[1] FPGA: incarc gateware...");
   do_fpga_bringup();
   Serial.printf("[1] FPGA: stare %d (1=OK, -1=eroare: nSTATUS/CONF_DONE, 2=fara gateware)\n", g_fpga_state);
+  print_pins();
+  print_load_diag();
   g_freq_dirty = false;
   Serial.println("[2] RX: pornesc PIO + DMA...");
   Serial.println(rx_start() ? "[2] RX: pornit" : "[2] RX: EROARE");
@@ -439,7 +554,7 @@ void loop1() {
   snprintf(l, sizeof(l), "pas %lu Hz", (unsigned long)STEPS[step_idx]);
   oled.drawStr(0, 32, l);
   int st = g_fpga_state;
-  snprintf(l, sizeof(l), "FPGA %s gw %u.%u", st == 1 ? "OK" : st == 2 ? "lipsa" : st < 0 ? "ERR" : "-",
+  snprintf(l, sizeof(l), "FPGA %s gw %u.%u", st == 1 ? "OK" : st == 2 ? "lipsa" : st == -2 ? "NU RASP" : st < 0 ? "ERR" : "-",
            g_gw_major, g_gw_minor);
   oled.drawStr(0, 44, l);
   snprintf(l, sizeof(l), "%lu IQ/s %s", (unsigned long)g_pairs_s, g_synced ? "SYNC" : "nosync");
