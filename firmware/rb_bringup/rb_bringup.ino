@@ -137,8 +137,8 @@ static volatile uint32_t dma_overruns = 0;
 
 static void dma_irq_handler() {
   for (int b = 0; b < 2; b++) {
-    if (dma_channel_get_irq0_status(dma_ch[b])) {
-      dma_channel_acknowledge_irq0(dma_ch[b]);
+    if (dma_channel_get_irq1_status(dma_ch[b])) {
+      dma_channel_acknowledge_irq1(dma_ch[b]);
       if (buf_ready_mask & (1u << b)) dma_overruns++;  // bufferul nu fusese procesat
       buf_ready_mask |= (1u << b);
       // re-armează canalul terminat (pornește când îl înlănțuie celălalt)
@@ -148,9 +148,12 @@ static void dma_irq_handler() {
   }
 }
 
-static void rx_start() {
+static bool rx_start() {
+  if (!pio_can_add_program(rx_pio, &rx_iq_program)) { Serial.println("[RX] PIO: fara loc pt. program"); return false; }
+  int sm = pio_claim_unused_sm(rx_pio, false);
+  if (sm < 0) { Serial.println("[RX] PIO: niciun state machine liber"); return false; }
+  rx_sm  = (uint)sm;
   rx_off = pio_add_program(rx_pio, &rx_iq_program);
-  rx_sm  = pio_claim_unused_sm(rx_pio, true);
 
   pio_sm_config c = pio_get_default_sm_config();
   sm_config_set_wrap(&c, rx_off + 0, rx_off + 17);
@@ -171,7 +174,10 @@ static void rx_start() {
 
   pio_sm_init(rx_pio, rx_sm, rx_off, &c);
 
-  for (int b = 0; b < 2; b++) dma_ch[b] = dma_claim_unused_channel(true);
+  for (int b = 0; b < 2; b++) {
+    dma_ch[b] = dma_claim_unused_channel(false);
+    if (dma_ch[b] < 0) { Serial.println("[RX] DMA: niciun canal liber"); return false; }
+  }
   for (int b = 0; b < 2; b++) {
     dma_channel_config dc = dma_channel_get_default_config(dma_ch[b]);
     channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
@@ -180,12 +186,13 @@ static void rx_start() {
     channel_config_set_dreq(&dc, pio_get_dreq(rx_pio, rx_sm, false));
     channel_config_set_chain_to(&dc, dma_ch[b ^ 1]);
     dma_channel_configure(dma_ch[b], &dc, dma_buf[b], &rx_pio->rxf[rx_sm], DMA_WORDS, false);
-    dma_channel_set_irq0_enabled(dma_ch[b], true);
+    dma_channel_set_irq1_enabled(dma_ch[b], true);
   }
-  irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_handler);
-  irq_set_enabled(DMA_IRQ_0, true);
+  irq_add_shared_handler(DMA_IRQ_1, dma_irq_handler, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+  irq_set_enabled(DMA_IRQ_1, true);
   dma_channel_start(dma_ch[0]);
   pio_sm_set_enabled(rx_pio, rx_sm, true);
+  return true;
 }
 
 // ============================================================
@@ -276,12 +283,15 @@ static void do_fpga_bringup() {
 // ============================================================
 void setup() {
   Serial.begin(115200);
+  uint32_t t_usb = millis();
+  while (!Serial && millis() - t_usb < 3000) delay(10);   // lasă timp terminalului
+  Serial.printf("\nrb_bringup pe %s\n", RB_BOARD_NAME);
 
   gpio_init(PIN_FPGA_NCONFIG);  gpio_set_dir(PIN_FPGA_NCONFIG, GPIO_OUT); gpio_put(PIN_FPGA_NCONFIG, 1);
   gpio_init(PIN_FPGA_DATA0);    gpio_set_dir(PIN_FPGA_DATA0, GPIO_OUT);
   gpio_init(PIN_FPGA_DCLK);     gpio_set_dir(PIN_FPGA_DCLK, GPIO_OUT);
-  gpio_init(PIN_FPGA_NSTATUS);  gpio_set_dir(PIN_FPGA_NSTATUS, GPIO_IN);
-  gpio_init(PIN_FPGA_CONFDONE); gpio_set_dir(PIN_FPGA_CONFDONE, GPIO_IN);
+  gpio_init(PIN_FPGA_NSTATUS);  gpio_set_dir(PIN_FPGA_NSTATUS, GPIO_IN);  gpio_pull_down(PIN_FPGA_NSTATUS);
+  gpio_init(PIN_FPGA_CONFDONE); gpio_set_dir(PIN_FPGA_CONFDONE, GPIO_IN); gpio_pull_down(PIN_FPGA_CONFDONE);
 
   spi_init(RB_SPI, 1000000);                         // 1 MHz la început (PA3GSB: 10 MHz)
   spi_set_format(RB_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
@@ -291,9 +301,13 @@ void setup() {
   gpio_init(PIN_SPI_CE0); gpio_set_dir(PIN_SPI_CE0, GPIO_OUT); gpio_put(PIN_SPI_CE0, 1);
   gpio_init(PIN_SPI_CE1); gpio_set_dir(PIN_SPI_CE1, GPIO_OUT); gpio_put(PIN_SPI_CE1, 1);
 
+  Serial.println("[1] FPGA: incarc gateware...");
   do_fpga_bringup();
+  Serial.printf("[1] FPGA: stare %d (1=OK, -1=eroare: nSTATUS/CONF_DONE, 2=fara gateware)\n", g_fpga_state);
   g_freq_dirty = false;
-  rx_start();
+  Serial.println("[2] RX: pornesc PIO + DMA...");
+  Serial.println(rx_start() ? "[2] RX: pornit" : "[2] RX: EROARE");
+  print_status();
 }
 
 void loop() {
