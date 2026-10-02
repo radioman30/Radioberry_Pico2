@@ -13,7 +13,7 @@
 // Setările (frecvență, mod, pas, filtre, volum, câștig, memoria benzilor) se salvează în flash la 5 s
 //     după ultima schimbare și se reîncarcă la pornire.
 // CAT: emulare Kenwood TS-2000 pe același port (comenzi cu „;”): WSJT-X, fldigi, Omni-Rig/HDSDR.
-// USB (115200): s stare | f<Hz> frecvența | m<0-5> modul (USB LSB CW AM FM SAM) | l<dBFS> squelch (l0 = oprit) | n<0-3> reducere zgomot | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
+// USB (115200): s stare | f<Hz> frecvența | m<0-5> modul (USB LSB CW AM FM SAM) | l<dBFS> squelch (l0 = oprit) | n<0-3> reducere zgomot | c calibrare automată (în SAM, pe o stație AM) | c<ppb> calibrare manuală | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -74,6 +74,13 @@ static volatile int      g_mode = MODE_USB;
 // (Inversarea pusă pe 1 oct a fost judecată după ureche, pe când perechea I/Q era încă decalată cu un cadru.)
 // Comanda USB „x” comută orientarea, pentru teste.
 static volatile bool     g_iq_inv = false;
+// Calibrarea frecvenței: eroarea ceasului Radioberry, în ppb (+ = placa recepționa mai sus decât afișa).
+// Măsurat 3 oct: ~+23 ppm (stațiile de pe 9640/9630 kHz apăreau cu 222 Hz sub centru).
+static volatile int32_t  g_cal_ppb = 0;
+static inline uint32_t rb_freq() {                  // frecvența trimisă la FPGA = cea afișată, corectată
+  int64_t f = g_freq;
+  return (uint32_t)(f - (f * g_cal_ppb + (g_cal_ppb >= 0 ? 500000000LL : -500000000LL)) / 1000000000LL);
+}
 // butoane pe pinul 18 (vezi keys_read)
 enum { K_NONE, K_SW, K_MOD, K_BAND, K_FILT, K_STEP };
 static volatile bool     g_keys_rc = false;         // rețeaua RC e montată (detectat la pornire)
@@ -495,7 +502,7 @@ static void radio_start() {
   g_fpga = fpga_load();
   if (g_fpga == 1) {
     delay(200);                                      // ieșirea din reset înainte de primul cadru SPI
-    rb_cmd(0x00, RB_REG0); rb_cmd(0x02, g_freq); rb_cmd(0x04, g_freq); rb_cmd(0x14, rb_gain_word());
+    rb_cmd(0x00, RB_REG0); rb_cmd(0x02, rb_freq()); rb_cmd(0x04, rb_freq()); rb_cmd(0x14, rb_gain_word());
   }
   g_ui_ready = true;
 }
@@ -669,6 +676,18 @@ static void handle_cmd(const char *s) {
   if (s[0] == 'v' && v >= 0 && v <= 100)          g_vol = v;
   if (s[0] == 'l' && (v == 0 || (v >= -130 && v <= -40))) g_sql = v;
   if (s[0] == 'n' && v >= 0 && v <= 3)            g_nr = v;
+  if (s[0] == 'c') {
+    if (s[1] == 0) {                                 // automat: decalajul măsurat de PLL-ul SAM pe o stație AM
+      float off = g_sam_offset_hz;
+      if (g_mode != MODE_SAM) { Serial.printf("calibrare: treci intai pe SAM, pe o statie AM puternica\n"); return; }
+      if (fabsf(off) > 290 || g_smeter_db < -100) { Serial.printf("calibrare: SAM nu e prins (%.0f Hz, S %.0f dBFS)\n", (double)off, (double)g_smeter_db); return; }
+      // purtătoarea apare la +off Hz -> placa e acordată cu off Hz prea jos -> eroarea scade cu off/f
+      g_cal_ppb -= (int32_t)lroundf(off / (float)g_freq * 1e9f);
+    } else if (v >= -200000 && v <= 200000) g_cal_ppb = v;
+    g_freq_dirty = true;
+    Serial.printf("calibrare: %+.3f ppm (%ld ppb)\n", g_cal_ppb / 1000.0, (long)g_cal_ppb);
+    return;
+  }
   if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; g_gain_dirty = true; }
   Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s | S %.1f dBFS | drop %lu under %lu | mic USB %s (aruncate %lu) | SQL %d %s | NR %d | SAM %+.0f Hz\n",
                 g_fpga == 1 ? "OK" : "ERR", g_gw_major, g_gw_minor, (unsigned long)g_freq, MODE_NAME[g_mode],
@@ -690,7 +709,7 @@ void loop() {
     if (fm != dec_mode) { design_lowpass(h_dec, NDEC, fm ? 5600 : 4500, FS_IN); dec_mode = fm; }
     design_bandpass(g_mode);
   }
-  if (g_freq_dirty && g_fpga == 1) { g_freq_dirty = false; rb_cmd(0x02, g_freq); rb_cmd(0x04, g_freq); }
+  if (g_freq_dirty && g_fpga == 1) { g_freq_dirty = false; rb_cmd(0x02, rb_freq()); rb_cmd(0x04, rb_freq()); }
   if (g_gain_dirty && g_fpga == 1) { g_gain_dirty = false; rb_cmd(0x14, rb_gain_word()); }
 
   uint32_t now = millis();
@@ -698,8 +717,8 @@ void loop() {
     t_keep = now;
     switch (keep) {
       case 0: rb_cmd(0x00, RB_REG0); break;
-      case 1: rb_cmd(0x02, g_freq); break;
-      case 2: rb_cmd(0x04, g_freq); break;
+      case 1: rb_cmd(0x02, rb_freq()); break;
+      case 2: rb_cmd(0x04, rb_freq()); break;
       default: rb_cmd(0x14, rb_gain_word()); break;
     }
     keep = (keep + 1) % 4;
@@ -783,7 +802,7 @@ struct Settings {
   uint32_t freq;
   uint8_t  mode, step, vol; int8_t gain;
   uint8_t  bw[8];                                   // fix 8: loc pentru moduri noi fără schimbarea structurii
-  int8_t   sql; uint8_t nr; uint8_t rsv[6];
+  int8_t   sql; uint8_t nr; uint8_t rsv[2]; int32_t cal_ppb;    // cal_ppb: fost rezervă (0)
   uint32_t band_f[NBANDS];
   uint8_t  band_mode[NBANDS];
   uint32_t sum;
@@ -800,7 +819,7 @@ static uint32_t settings_sum(const Settings &x) {
 static void settings_snapshot(Settings &x) {
   memset(&x, 0, sizeof(x));
   x.magic = SET_MAGIC; x.freq = g_freq; x.mode = g_mode; x.step = step_idx;
-  x.vol = g_vol; x.gain = g_gain_db; x.sql = g_sql; x.nr = g_nr;
+  x.vol = g_vol; x.gain = g_gain_db; x.sql = g_sql; x.nr = g_nr; x.cal_ppb = g_cal_ppb;
   for (int m = 0; m < MODE_N; m++) x.bw[m] = g_bw_idx[m];
   for (int b = 0; b < NBANDS; b++) { x.band_f[b] = BANDS[b].f; x.band_mode[b] = BANDS[b].mode; }
   x.sum = settings_sum(x);
@@ -816,6 +835,7 @@ static void settings_load() {
     if (x.vol <= 100) g_vol = x.vol;
     if (x.sql == 0 || (x.sql >= -130 && x.sql <= -40)) g_sql = x.sql;
     if (x.nr <= 3) g_nr = x.nr;
+    if (x.cal_ppb >= -200000 && x.cal_ppb <= 200000) g_cal_ppb = x.cal_ppb;
     if (x.gain >= -12 && x.gain <= 48) g_gain_db = x.gain;
     for (int m = 0; m < MODE_N; m++) if (x.bw[m] < bw_count(m)) g_bw_idx[m] = x.bw[m];
     for (int b = 0; b < NBANDS; b++) {
@@ -885,7 +905,7 @@ static int keys_read() {
   return K_NONE;                                         // eliberat chiar în timpul măsurării
 }
 
-enum { UI_FREQ, UI_STEP, UI_MODE, UI_FILT, UI_BAND, UI_VOL, UI_GAIN, UI_SQL, UI_NR, UI_N };
+enum { UI_FREQ, UI_STEP, UI_MODE, UI_FILT, UI_BAND, UI_VOL, UI_GAIN, UI_SQL, UI_NR, UI_CAL, UI_N };
 static int ui_sel = UI_FREQ;
 
 // ---------------- spectru + waterfall ----------------
@@ -1007,6 +1027,7 @@ void loop1() {
         g_sql = (v < -130) ? 0 : v; break;
       }
       case UI_NR: g_nr = constrain(g_nr + (int)d, 0, 3); break;
+      case UI_CAL: g_cal_ppb = constrain(g_cal_ppb + 100 * (int)d, -200000, 200000); g_freq_dirty = true; break;   // 0,1 ppm
     }
   }
   if (g_ui_ready) {                                   // butonul e pe DCLK: doar după configurare
@@ -1070,6 +1091,14 @@ void loop1() {
 
   // rândul de jos: pas, volum, câștig, filtru — sau squelch / NR când sunt selectate în meniu
   int x = 0;
+  if (ui_sel == UI_CAL) {                            // calibrare: ppm + decalajul SAM (rotește până ajunge ~0)
+    snprintf(l, sizeof(l), "CAL %+.1fppm", g_cal_ppb / 1000.0);
+    x = draw_item(1, 63, l, true);
+    if (g_mode == MODE_SAM) { snprintf(l, sizeof(l), "%+.0fHz", (double)g_sam_offset_hz); oled.drawStr(x + 2, 63, l); }
+    else oled.drawStr(x + 2, 63, "->SAM");
+    oled.sendBuffer();
+    return;
+  }
   if (ui_sel == UI_SQL || ui_sel == UI_NR) {
     if (g_sql) snprintf(l, sizeof(l), "SQL %d", g_sql); else snprintf(l, sizeof(l), "SQL off");
     x = draw_item(1, 63, l, ui_sel == UI_SQL);

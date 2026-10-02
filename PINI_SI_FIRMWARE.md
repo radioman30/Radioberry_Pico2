@@ -120,7 +120,7 @@ condensator prin rezistența fiecăruia.
   Pe ecran „Q” jos-dreapta, inversat când e închis.
 - **Reducere de zgomot** (meniu NR, oprit / 1 / 2 / 3), pe ecran „N”. Simulat: +9 dB (NR1) … +14,5 dB (NR3) SNR.
 - **SAM:** PLL pe purtătoare (prinde ±300 Hz în ~20 ms); la fading distorsiunea scade de la -12 dB la -32 dB (simulat).
-- Meniul encoderului: FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN → **SQL → NR**.
+- Meniul encoderului: FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN → **SQL → NR → CAL**.
 - **Filtre:** SSB 1,8 / 2,0 / 2,5 / 2,7 kHz · CW 250 / 500 / 1000 Hz · AM 6 / 8 kHz · FM 8 / 11 kHz.
 - **Benzi** (cu memorie): 160, 80, 60, 49 (AM), 40, 41 (AM), 31 (AM), 30, 20, 17, 15, 12, **CB** (FM), 10 m.
 - **Ecran:** frecvență, bandă, mod, S-metru, spectru ±24 kHz, waterfall, meniu jos (pas, volum, câștig, filtru).
@@ -131,7 +131,7 @@ condensator prin rezistența fiecăruia.
   - **IQ brut** — `python tools/iq_record.py -t 60 -o iq_rec` → WAV pentru HDSDR / SDR# / SDR++.
 
 **Comenzi pe COM12:** `s` stare · `f<Hz>` frecvență · `m<0-5>` mod (5 = SAM) · `v<0-100>` volum · `g<-12..48>` câștig ·
-`w<Hz>` filtru · `l<dBFS>` squelch (`l0` oprit) · `n<0-3>` NR · `k` / `kd` butoane · `x` inversează IQ (doar pentru teste; implicit corect = neinversat, verificat cu FT8) · `q1`/`q0` flux IQ · `z<start,stop,pas kHz>` baleiaj.
+`w<Hz>` filtru · `l<dBFS>` squelch (`l0` oprit) · `n<0-3>` NR · `c` / `c<ppb>` calibrare · `k` / `kd` butoane · `x` inversează IQ (doar pentru teste; implicit corect = neinversat, verificat cu FT8) · `q1`/`q0` flux IQ · `z<start,stop,pas kHz>` baleiaj.
 
 ---
 
@@ -190,12 +190,15 @@ USB-C-ul secundar nu mai poate fi folosit ca USB host după asta.
 
 ---
 
-## 9. Observat: ceasul Radioberry e decalat cu ~+23 ppm
+## 9. Calibrarea frecvenței (făcută 3 oct)
 
-Pe 2 oct, în IQ-ul de pe 9640 kHz, două stații AM diferite (9640 și 9630 kHz) apar amândouă la **+222 Hz**,
-iar bucla SAM se prinde la același decalaj → recepția e cu ~23 ppm sub frecvența afișată
-(~220 Hz pe 9,6 MHz, ~330 Hz pe 14 MHz). Corecția posibilă: calibrare în ppm în firmware, măsurată automat
-cu SAM pe o stație de radiodifuziune (care emite exact pe grilă).
+Ceasul Radioberry e decalat cu **+22,96 ppm** (fără corecție: ~220 Hz pe 9,6 MHz, ~330 Hz pe 14 MHz).
+Corecția se aplică frecvenței trimise la FPGA; afișajul, CAT-ul și benzile rămân pe frecvența reală. Se salvează.
+
+- **Automat (USB):** pe o stație AM puternică, mod **SAM**, comanda `c` → placa citește decalajul PLL-ului și se
+  corectează. Rezultat 3 oct: 9640 kHz -221 Hz → 0…1 Hz; verificat pe 7300 kHz: -4…-8 Hz (fără corecție ~-167 Hz).
+- **De pe placă:** meniu **CAL** (după NR): rotire = ±0,1 ppm; în SAM rândul de jos arată decalajul — rotește până ~0 Hz.
+- **Manual:** `c<ppb>` (ex. `c22961`), `c0` = fără corecție.
 
 ---
 
