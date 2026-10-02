@@ -115,7 +115,12 @@ condensator prin rezistența fiecăruia.
 
 ## 5. Ce face firmware-ul
 
-- **Recepție:** USB, LSB, CW, AM, **FM** (bandă îngustă), 10 kHz – 30 MHz, IQ 48 kHz de la FPGA.
+- **Recepție:** USB, LSB, CW, AM, **FM** (bandă îngustă), **SAM** (AM sincron), 10 kHz – 30 MHz, IQ 48 kHz de la FPGA.
+- **Squelch** (meniu SQL, oprit sau -130…-40 dBFS): taie căștile până apare semnal; USB-ul rămâne neatins.
+  Pe ecran „Q” jos-dreapta, inversat când e închis.
+- **Reducere de zgomot** (meniu NR, oprit / 1 / 2 / 3), pe ecran „N”. Simulat: +9 dB (NR1) … +14,5 dB (NR3) SNR.
+- **SAM:** PLL pe purtătoare (prinde ±300 Hz în ~20 ms); la fading distorsiunea scade de la -12 dB la -32 dB (simulat).
+- Meniul encoderului: FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN → **SQL → NR**.
 - **Filtre:** SSB 1,8 / 2,0 / 2,5 / 2,7 kHz · CW 250 / 500 / 1000 Hz · AM 6 / 8 kHz · FM 8 / 11 kHz.
 - **Benzi** (cu memorie): 160, 80, 60, 49 (AM), 40, 41 (AM), 31 (AM), 30, 20, 17, 15, 12, **CB** (FM), 10 m.
 - **Ecran:** frecvență, bandă, mod, S-metru, spectru ±24 kHz, waterfall, meniu jos (pas, volum, câștig, filtru).
@@ -125,8 +130,8 @@ condensator prin rezistența fiecăruia.
   - **microfon „Radioberry RX audio”** — audio demodulat 48 kHz, nivel fix (fără volumul căștilor);
   - **IQ brut** — `python tools/iq_record.py -t 60 -o iq_rec` → WAV pentru HDSDR / SDR# / SDR++.
 
-**Comenzi pe COM12:** `s` stare · `f<Hz>` frecvență · `m<0-4>` mod · `v<0-100>` volum · `g<-12..48>` câștig ·
-`w<Hz>` filtru · `k` / `kd` butoane · `x` inversează IQ · `q1`/`q0` flux IQ · `z<start,stop,pas kHz>` baleiaj.
+**Comenzi pe COM12:** `s` stare · `f<Hz>` frecvență · `m<0-5>` mod (5 = SAM) · `v<0-100>` volum · `g<-12..48>` câștig ·
+`w<Hz>` filtru · `l<dBFS>` squelch (`l0` oprit) · `n<0-3>` NR · `k` / `kd` butoane · `x` inversează IQ · `q1`/`q0` flux IQ · `z<start,stop,pas kHz>` baleiaj.
 
 ---
 
@@ -182,4 +187,13 @@ USB-C-ul secundar nu mai poate fi folosit ca USB host după asta.
   (comanda de drive), PTT cu timp maxim de emisie în firmware.
 - **Gateware:** rămânem pe 73.3 / 73.4. Verificat 3 oct: nici HL2 `gateware/bitfiles` (Radioberry doar 71.3 din 2020;
   74.x e doar pentru plăcile HL2), nici arhiva release `radioberry@rpi5` (dec 2025) nu au ceva mai nou.
+
+---
+
+## 9. Observat: ceasul Radioberry e decalat cu ~+23 ppm
+
+Pe 2 oct, în IQ-ul de pe 9640 kHz, două stații AM diferite (9640 și 9630 kHz) apar amândouă la **+222 Hz**,
+iar bucla SAM se prinde la același decalaj → recepția e cu ~23 ppm sub frecvența afișată
+(~220 Hz pe 9,6 MHz, ~330 Hz pe 14 MHz). Corecția posibilă: calibrare în ppm în firmware, măsurată automat
+cu SAM pe o stație de radiodifuziune (care emite exact pe grilă).
 

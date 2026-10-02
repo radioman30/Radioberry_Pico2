@@ -13,7 +13,7 @@
 // Setările (frecvență, mod, pas, filtre, volum, câștig, memoria benzilor) se salvează în flash la 5 s
 //     după ultima schimbare și se reîncarcă la pornire.
 // CAT: emulare Kenwood TS-2000 pe același port (comenzi cu „;”): WSJT-X, fldigi, Omni-Rig/HDSDR.
-// USB (115200): s stare | f<Hz> frecvența | m<0-4> modul (USB LSB CW AM FM) | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
+// USB (115200): s stare | f<Hz> frecvența | m<0-5> modul (USB LSB CW AM FM SAM) | l<dBFS> squelch (l0 = oprit) | n<0-3> reducere zgomot | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -65,8 +65,8 @@ static const uint8_t RX_GP[8] = { 23, 20, 19, 18, 16, 13, 9, 15 };   // BCM 23,2
 // ============================================================
 // Stare partajată
 // ============================================================
-enum { MODE_USB, MODE_LSB, MODE_CW, MODE_AM, MODE_FM, MODE_N };   // FM = bandă îngustă (NBFM), 10 m / CB
-static const char *MODE_NAME[MODE_N] = { "USB", "LSB", "CW", "AM", "FM" };
+enum { MODE_USB, MODE_LSB, MODE_CW, MODE_AM, MODE_FM, MODE_SAM, MODE_N };   // FM = NBFM (10 m, CB); SAM = AM sincron
+static const char *MODE_NAME[MODE_N] = { "USB", "LSB", "CW", "AM", "FM", "SAM" };
 static volatile uint32_t g_freq = 7074000;
 static volatile int      g_mode = MODE_USB;
 // Radioberry dă spectrul în oglindă față de convenția I+jQ (LSB apărea ca USB): Q se neagă la intrare.
@@ -161,14 +161,14 @@ static const int BW_SSB[] = { 1800, 2000, 2500, 2700 };
 static const int BW_CW[]  = { 250, 500, 1000 };
 static const int BW_AM[]  = { 6000, 8000 };
 static const int BW_FM[]  = { 8000, 11000 };            // NBFM: deviație ±2,5 kHz (10 m, CB)
-static volatile int g_bw_idx[MODE_N] = { 2, 2, 1, 1, 1 };  // USB/LSB 2,5 kHz, CW 500 Hz, AM 8 kHz, FM 11 kHz
+static volatile int g_bw_idx[MODE_N] = { 2, 2, 1, 1, 1, 1 };  // USB/LSB 2,5 kHz, CW 500 Hz, AM/SAM 8 kHz, FM 11 kHz
 
 static int bw_count(int mode) {
-  return mode == MODE_CW ? 3 : (mode == MODE_AM || mode == MODE_FM) ? 2 : 4;
+  return mode == MODE_CW ? 3 : (mode == MODE_AM || mode == MODE_SAM || mode == MODE_FM) ? 2 : 4;
 }
 static int bw_hz(int mode) {
   int i = g_bw_idx[mode];
-  return mode == MODE_CW ? BW_CW[i] : mode == MODE_AM ? BW_AM[i] : mode == MODE_FM ? BW_FM[i] : BW_SSB[i];
+  return mode == MODE_CW ? BW_CW[i] : (mode == MODE_AM || mode == MODE_SAM) ? BW_AM[i] : mode == MODE_FM ? BW_FM[i] : BW_SSB[i];
 }
 // marginile benzii trecute, în Hz față de frecvența acordată
 static void filter_edges(int mode, float *lo, float *hi) {
@@ -196,6 +196,107 @@ static void design_bandpass(int mode) {
 }
 
 // un eșantion IQ la 48 kHz -> 0 sau 1 eșantion audio (la 12 kHz)
+// ============================================================
+// Squelch, reducere de zgomot, AM sincron. Ideile vin din PicoRX (github.com/dawsonjon/PicoRX, MIT,
+// © 2024 Jonathan P Dawson); aici rescrise în virgulă mobilă pentru lanțul nostru de 12 kHz.
+// ============================================================
+static volatile int  g_sql = 0;                      // 0 = oprit; altfel pragul de deschidere în dBFS (-130..-40)
+static volatile int  g_nr = 0;                       // 0 = oprit; 1..3 = tăria reducerii de zgomot
+static volatile bool g_sq_open = true;               // pentru ecran
+
+// Squelch: nivelul din banda filtrului, netezit ~17 ms; deschide peste prag, închide la 3 dB sub prag
+// după 250 ms de reținere (să nu taie între cuvinte). Poarta se deschide/închide lin (~20 ms), fără clicuri.
+static float sq_pow = 1e-12f, sq_gate = 1;
+static int sq_hang = 0;
+static float squelch_gate(float p) {
+  sq_pow += 0.005f * (p - sq_pow);
+  int thr = g_sql;
+  bool open = g_sq_open;
+  if (!thr) open = true;
+  else {
+    float lvl = 10 * log10f(sq_pow + 1e-20f);
+    if (lvl > thr) { open = true; sq_hang = FS / 4; }
+    else if (sq_hang > 0) sq_hang--;
+    else if (lvl < thr - 3) open = false;
+  }
+  g_sq_open = open;
+  sq_gate += ((open ? 1.0f : 0.0f) - sq_gate) * 0.004f;
+  return sq_gate;
+}
+
+// Reducere de zgomot spectrală pe audio (12 kHz): FFT 256 cu suprapunere 50 % (fereastră Hann, sumă = 1).
+// Puterea pe fiecare bin se netezește în timp (0,7); zgomotul = minimul ei (urcă ~6 dB/s), × 2 ca să compenseze
+// faptul că minimul stă sub medie. Câștig = 1 - α·zgomot/putere, limitat jos și netezit (mai puțin „zgomot
+// muzical”). Întârziere 256 eșantioane = 21 ms. Simulat (ton intermitent în zgomot alb, SNR 3 dB): NR1 +9 dB,
+// NR3 +14,5 dB SNR, zgomotul din pauze -10 / -18 dB, semnalul util -0,2 dB.
+#define NR_N 256
+#define NR_H (NR_N / 2)
+static void fft256(float *re, float *im);
+static float nr_in[NR_N], nr_ola[NR_H], nr_out[NR_H], nr_win[NR_N];
+static float nr_noise[NR_H + 1], nr_gain[NR_H + 1], nr_pws[NR_H + 1];
+static int nr_pos = 0;
+static float nr_process(float x) {
+  static bool init = false;
+  if (!init) {
+    for (int k = 0; k < NR_N; k++) nr_win[k] = 0.5f - 0.5f * cosf(2 * (float)M_PI * k / NR_N);
+    for (int k = 0; k <= NR_H; k++) { nr_noise[k] = -1; nr_gain[k] = 1; nr_pws[k] = 0; }
+    init = true;
+  }
+  float y = nr_out[nr_pos];
+  nr_in[NR_H + nr_pos] = x;
+  if (++nr_pos < NR_H) return y;
+  nr_pos = 0;
+
+  static float re[NR_N], im[NR_N];
+  for (int k = 0; k < NR_N; k++) { re[k] = nr_in[k] * nr_win[k]; im[k] = 0; }
+  fft256(re, im);
+  int lvl = g_nr;
+  float alpha = lvl == 1 ? 1.0f : lvl == 2 ? 1.6f : 2.4f;
+  float gmin  = lvl == 1 ? 0.20f : lvl == 2 ? 0.12f : 0.07f;
+  for (int k = 0; k <= NR_H; k++) {
+    float pw = re[k] * re[k] + im[k] * im[k];
+    float pws = nr_pws[k] = 0.7f * nr_pws[k] + 0.3f * pw;
+    float nz = nr_noise[k];
+    if (nz < 0) nz = pws = nr_pws[k] = pw;                   // primul cadru: pornește de la nivelul curent
+    nz = (pws < nz) ? pws : nz * 1.015f;                     // 1.015^(12000/128) ≈ +6 dB/s
+    if (nz < 1e-16f) nz = 1e-16f;
+    nr_noise[k] = nz;
+    float g = 1 - alpha * 2.0f * nz / (pws + 1e-20f);
+    if (g < gmin) g = gmin;
+    nr_gain[k] = 0.5f * nr_gain[k] + 0.5f * g;
+    float gg = nr_gain[k];
+    re[k] *= gg; im[k] *= gg;
+    if (k > 0 && k < NR_H) { re[NR_N - k] *= gg; im[NR_N - k] *= gg; }
+  }
+  for (int k = 0; k < NR_N; k++) im[k] = -im[k];       // IFFT = conj(FFT(conj(X))) / N
+  fft256(re, im);
+  for (int k = 0; k < NR_H; k++) {
+    nr_out[k] = nr_ola[k] + re[k] / NR_N;
+    nr_ola[k] = re[k + NR_H] / NR_N;
+  }
+  memmove(nr_in, nr_in + NR_H, NR_H * sizeof(float));
+  return y;
+}
+
+// AM sincron: PLL de ordinul 2 pe purtătoare (bandă ~30 Hz, prinde ±300 Hz); demodularea = partea în fază
+// după rotirea cu faza purtătoarei. La fading selectiv nu mai distorsionează ca detectorul de anvelopă.
+static float sam_ph = 0, sam_fr = 0, sam_dc_x = 0, sam_dc_y = 0;
+static volatile float g_sam_offset_hz = 0;
+static float sam_demod(float yr, float yi) {
+  float c = cosf(sam_ph), sn = sinf(sam_ph);
+  float zr = yr * c + yi * sn, zi = yi * c - yr * sn;  // y · e^(-j·φ)
+  float e = atan2f(zi, zr);                            // eroarea de fază
+  sam_fr += 0.000247f * e;                             // ωn = 2π·30/12000, ζ = 0,707
+  const float FMAX = 2 * (float)M_PI * 300 / 12000;
+  if (sam_fr > FMAX) sam_fr = FMAX; if (sam_fr < -FMAX) sam_fr = -FMAX;
+  sam_ph += sam_fr + 0.0222f * e;
+  if (sam_ph > (float)M_PI) sam_ph -= 2 * (float)M_PI; else if (sam_ph < -(float)M_PI) sam_ph += 2 * (float)M_PI;
+  g_sam_offset_hz = sam_fr * 12000 / (2 * (float)M_PI);
+  float a = zr - sam_dc_x + 0.995f * sam_dc_y;         // purtătoarea devine DC: se blochează
+  sam_dc_x = zr; sam_dc_y = a;
+  return a;
+}
+
 static float g_dsp_raw = 0;                          // ieșirea demodulatorului fără volumul căștilor (pt. USB)
 
 static bool dsp_push(float I, float Q, float *out) {
@@ -214,7 +315,7 @@ static bool dsp_push(float I, float Q, float *out) {
   const float *ri = &bI[bpos], *rq = &bQ[bpos];
   float yr = 0, yi = 0;
   int mode = g_mode;
-  if (mode == MODE_AM || mode == MODE_FM) {
+  if (mode == MODE_AM || mode == MODE_SAM || mode == MODE_FM) {
     for (int k = 0; k < NBP; k++) { yr += hb_r[k] * ri[k]; yi += hb_r[k] * rq[k]; }
   } else {
     for (int k = 0; k < NBP; k++) { yr += hb_r[k] * ri[k] - hb_i[k] * rq[k]; yi += hb_r[k] * rq[k] + hb_i[k] * ri[k]; }
@@ -230,9 +331,13 @@ static bool dsp_push(float I, float Q, float *out) {
     pr = yr; pq = yi;
     d *= 12000.0f / (2 * (float)M_PI * 3000.0f);     // ±3 kHz deviație -> ±1
     de += 0.41f * (d - de);                          // de-accentuare, pol la ~1 kHz
-    g_dsp_raw = de * 0.5f;
-    *out = g_dsp_raw * (g_vol / 100.0f);             // FM are amplitudine constantă: fără AGC
+    float fm = de * 0.5f;
+    if (g_nr) fm = nr_process(fm);
+    g_dsp_raw = fm;                                  // FM are amplitudine constantă: fără AGC
+    *out = g_dsp_raw * (g_vol / 100.0f) * squelch_gate(p);
     return true;
+  } else if (mode == MODE_SAM) {
+    a = sam_demod(yr, yi);
   } else if (mode == MODE_AM) {
     float env = sqrtf(p);
     a = env - dc_x + 0.995f * dc_y;                  // blocare DC
@@ -240,13 +345,14 @@ static bool dsp_push(float I, float Q, float *out) {
   } else {
     a = yr;                                          // SSB/CW: partea reală
   }
+  if (g_nr) a = nr_process(a);                       // înaintea AGC: zgomotul de fond e stabil acolo
   // AGC: atac instant, revenire ~0,5 s
   float m = fabsf(a);
   agc_env = (m > agc_env) ? m : agc_env * 0.99983f;
   if (agc_env < 3e-6f) agc_env = 3e-6f;
   float g = 0.3f / agc_env;
-  g_dsp_raw = a * g;
-  *out = g_dsp_raw * (g_vol / 100.0f);
+  g_dsp_raw = a * g;                                 // USB-ul (WSJT-X etc.) primește fără squelch
+  *out = g_dsp_raw * (g_vol / 100.0f) * squelch_gate(p);
   return true;
 }
 
@@ -555,11 +661,14 @@ static void handle_cmd(const char *s) {
   }
   if (s[0] == 'm' && v >= 0 && v < MODE_N)        { g_mode = v; g_mode_dirty = true; }
   if (s[0] == 'v' && v >= 0 && v <= 100)          g_vol = v;
+  if (s[0] == 'l' && (v == 0 || (v >= -130 && v <= -40))) g_sql = v;
+  if (s[0] == 'n' && v >= 0 && v <= 3)            g_nr = v;
   if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; g_gain_dirty = true; }
-  Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s | S %.1f dBFS | drop %lu under %lu | mic USB %s (aruncate %lu)\n",
+  Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s | S %.1f dBFS | drop %lu under %lu | mic USB %s (aruncate %lu) | SQL %d %s | NR %d | SAM %+.0f Hz\n",
                 g_fpga == 1 ? "OK" : "ERR", g_gw_major, g_gw_minor, (unsigned long)g_freq, MODE_NAME[g_mode],
                 g_vol, g_gain_db, (unsigned long)g_iq_rate, g_smeter_db, (unsigned long)g_audio_drop, (unsigned long)g_audio_under,
-                usb_audio_streaming() ? "activ" : "oprit", (unsigned long)usb_audio_drops());
+                usb_audio_streaming() ? "activ" : "oprit", (unsigned long)usb_audio_drops(),
+                g_sql, g_sql ? (g_sq_open ? "deschis" : "inchis") : "oprit", g_nr, (double)g_sam_offset_hz);
 }
 
 void loop() {
@@ -667,12 +776,13 @@ struct Settings {
   uint32_t magic;
   uint32_t freq;
   uint8_t  mode, step, vol; int8_t gain;
-  uint8_t  bw[MODE_N];
+  uint8_t  bw[8];                                   // fix 8: loc pentru moduri noi fără schimbarea structurii
+  int8_t   sql; uint8_t nr; uint8_t rsv[6];
   uint32_t band_f[NBANDS];
   uint8_t  band_mode[NBANDS];
   uint32_t sum;
 };
-static const uint32_t SET_MAGIC = 0x52425332;          // "RBS2"; schimbă-l când se schimbă structura
+static const uint32_t SET_MAGIC = 0x52425333;          // "RBS3"; schimbă-l când se schimbă structura
 static Settings set_saved;
 
 static uint32_t settings_sum(const Settings &x) {
@@ -684,7 +794,7 @@ static uint32_t settings_sum(const Settings &x) {
 static void settings_snapshot(Settings &x) {
   memset(&x, 0, sizeof(x));
   x.magic = SET_MAGIC; x.freq = g_freq; x.mode = g_mode; x.step = step_idx;
-  x.vol = g_vol; x.gain = g_gain_db;
+  x.vol = g_vol; x.gain = g_gain_db; x.sql = g_sql; x.nr = g_nr;
   for (int m = 0; m < MODE_N; m++) x.bw[m] = g_bw_idx[m];
   for (int b = 0; b < NBANDS; b++) { x.band_f[b] = BANDS[b].f; x.band_mode[b] = BANDS[b].mode; }
   x.sum = settings_sum(x);
@@ -698,6 +808,8 @@ static void settings_load() {
     if (x.mode < MODE_N) g_mode = x.mode;
     if (x.step < 5) step_idx = x.step;
     if (x.vol <= 100) g_vol = x.vol;
+    if (x.sql == 0 || (x.sql >= -130 && x.sql <= -40)) g_sql = x.sql;
+    if (x.nr <= 3) g_nr = x.nr;
     if (x.gain >= -12 && x.gain <= 48) g_gain_db = x.gain;
     for (int m = 0; m < MODE_N; m++) if (x.bw[m] < bw_count(m)) g_bw_idx[m] = x.bw[m];
     for (int b = 0; b < NBANDS; b++) {
@@ -767,7 +879,7 @@ static int keys_read() {
   return K_NONE;                                         // eliberat chiar în timpul măsurării
 }
 
-enum { UI_FREQ, UI_STEP, UI_MODE, UI_FILT, UI_BAND, UI_VOL, UI_GAIN, UI_N };
+enum { UI_FREQ, UI_STEP, UI_MODE, UI_FILT, UI_BAND, UI_VOL, UI_GAIN, UI_SQL, UI_NR, UI_N };
 static int ui_sel = UI_FREQ;
 
 // ---------------- spectru + waterfall ----------------
@@ -883,6 +995,12 @@ void loop1() {
       case UI_BAND: band_step(d > 0 ? 1 : -1); break;
       case UI_VOL:  g_vol = constrain(g_vol + 2 * (int)d, 0, 100); break;
       case UI_GAIN: g_gain_db = constrain(g_gain_db + (int)d, -12, 48); g_gain_dirty = true; break;
+      case UI_SQL: {                                 // oprit, apoi -130 ... -40 dBFS în pași de 2 dB
+        int v = g_sql ? g_sql : -132;
+        v = constrain(v + 2 * (int)d, -132, -40);
+        g_sql = (v < -130) ? 0 : v; break;
+      }
+      case UI_NR: g_nr = constrain(g_nr + (int)d, 0, 3); break;
     }
   }
   if (g_ui_ready) {                                   // butonul e pe DCLK: doar după configurare
@@ -944,8 +1062,16 @@ void loop1() {
 
   spectrum_draw();
 
-  // rândul de jos: pas, volum, câștig
+  // rândul de jos: pas, volum, câștig, filtru — sau squelch / NR când sunt selectate în meniu
   int x = 0;
+  if (ui_sel == UI_SQL || ui_sel == UI_NR) {
+    if (g_sql) snprintf(l, sizeof(l), "SQL %d", g_sql); else snprintf(l, sizeof(l), "SQL off");
+    x = draw_item(1, 63, l, ui_sel == UI_SQL);
+    if (g_nr) snprintf(l, sizeof(l), "NR %d", g_nr); else snprintf(l, sizeof(l), "NR off");
+    draw_item(x + 6, 63, l, ui_sel == UI_NR);
+    oled.sendBuffer();
+    return;
+  }
   uint32_t st = STEPS[step_idx];
   if (st >= 1000) snprintf(l, sizeof(l), "P%luk", (unsigned long)(st / 1000)); else snprintf(l, sizeof(l), "P%lu", (unsigned long)st);
   x = draw_item(x + 1, 63, l, ui_sel == UI_STEP);
@@ -954,6 +1080,8 @@ void loop1() {
   int bw = bw_hz(g_mode);
   if (bw >= 1000) snprintf(l, sizeof(l), "F%d.%d", bw / 1000, bw % 1000 / 100); else snprintf(l, sizeof(l), "F%d", bw);
   x = draw_item(x, 63, l, ui_sel == UI_FILT);
+  if (g_nr) oled.drawStr(101, 63, "N");             // reducerea de zgomot pornită
+  if (g_sql) draw_item(108, 63, "Q", !g_sq_open);     // squelch: „Q” inversat = închis
   if (g_fpga != 1) oled.drawStr(113, 63, "ERR");
   else if (g_keys_rc) oled.drawStr(118, 63, "RC");   // rețeaua de butoane detectată
   oled.sendBuffer();
