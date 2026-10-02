@@ -27,3 +27,6 @@ iq_rec/
 # firmware compilat (contine gateware tert)
 release/
 *.uf2
+
+# surse/documentatie terta
+referinte/

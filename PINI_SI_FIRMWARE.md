@@ -141,9 +141,30 @@ condensator prin rezistența fiecăruia.
 
 ---
 
-## 7. Plănuit: WM8960 (intrare + ieșire audio)
+## 7. Plănuit: WM8960 Audio HAT (intrare + ieșire audio)
 
-- I2C comun cu OLED-ul (GP2/GP3; WM8960 la adresa 0x1A).
-- I2S refolosește pinii PCM5102A: BCK GP4, LRCK GP5, DACDAT GP14.
-- **Mai trebuie 1 pin** pentru ADCDAT — de ales dintre GPIO-urile de pe USB-C-ul secundar sau slotul microSD.
-- HAT-ul se leagă **cu fire**, nu se înfige peste Radioberry (folosește pinii de date RX 18–21).
+Sursă: [wiki Waveshare](https://www.waveshare.com/wiki/WM8960_Audio_HAT), repo clonat local în
+`referinte/WM8960-Audio-HAT` (driver Linux = referință pentru registre). HAT-ul: alimentare **5 V**, logică 3,3 V,
+cristal **24 MHz** propriu (MCLK), codec **slave** (BCLK/LRCLK vin de la RP2350), I2C **0x1A**, 2 microfoane MEMS,
+mufă căști, ieșire difuzor stereo.
+
+**Se leagă cu fire** — nu se înfige peste Radioberry (HAT-ul folosește BCM18–21 = date RX ale Radioberry).
+Înlocuiește PCM5102A (aceiași pini I2S).
+
+| Pin pe HAT (format Pi) | Semnal | Se leagă la PiZero | GP |
+|---|---|---|---|
+| 2 sau 4 | 5V | header pin 2 sau 4 (5V) | — |
+| 6 | GND | orice GND | — |
+| 3 | SDA | header pin 3 (comun cu OLED) | 2 |
+| 5 | SCL | header pin 5 (comun cu OLED) | 3 |
+| 12 (BCM18) | BCLK | header pin 8 | 4 |
+| 35 (BCM19) | LRCLK | header pin 10 | 5 |
+| 40 (BCM21) | DACDAT (spre căști) | header pin 7 | 14 |
+| **38 (BCM20)** | **ADCDAT (de la microfon)** | **USB-C secundar, linia D+** (după R8 22 Ω) | **28** |
+| 11 (BCM17) | buton HAT | **NU SE LEAGĂ** (pe PiZero e ieșire a FPGA-ului) | — |
+
+**De ce GPIO28:** pe RP2350B un bloc PIO vede GPIO 0–31 *sau* 16–47; I2S-ul folosește deja GP4/5/14, deci intrarea
+trebuie să fie sub 32. Din schema PiZero: USB-C secundar (PIO-USB) = **D+ GPIO28 / D− GPIO29** (prin R8/R9 22 Ω);
+slotul microSD = GPIO30, 31, 40–43 (40–43 sunt peste 31, nepotrivite); mini-HDMI = GPIO32–39, 44–46.
+Acces la GPIO28: un cablu/adaptor USB-C tăiat (D+ = de obicei firul verde) sau direct pe pad-ul lui R8.
+USB-C-ul secundar nu mai poate fi folosit ca USB host după asta.
