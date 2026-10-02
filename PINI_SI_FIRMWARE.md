@@ -131,7 +131,7 @@ condensator prin rezistența fiecăruia.
   - **IQ brut** — `python tools/iq_record.py -t 60 -o iq_rec` → WAV pentru HDSDR / SDR# / SDR++.
 
 **Comenzi pe COM12:** `s` stare · `f<Hz>` frecvență · `m<0-5>` mod (5 = SAM) · `v<0-100>` volum · `g<-12..48>` câștig ·
-`w<Hz>` filtru · `l<dBFS>` squelch (`l0` oprit) · `n<0-3>` NR · `k` / `kd` butoane · `x` inversează IQ · `q1`/`q0` flux IQ · `z<start,stop,pas kHz>` baleiaj.
+`w<Hz>` filtru · `l<dBFS>` squelch (`l0` oprit) · `n<0-3>` NR · `k` / `kd` butoane · `x` inversează IQ (doar pentru teste; implicit corect = neinversat, verificat cu FT8) · `q1`/`q0` flux IQ · `z<start,stop,pas kHz>` baleiaj.
 
 ---
 
@@ -196,4 +196,13 @@ Pe 2 oct, în IQ-ul de pe 9640 kHz, două stații AM diferite (9640 și 9630 kHz
 iar bucla SAM se prinde la același decalaj → recepția e cu ~23 ppm sub frecvența afișată
 (~220 Hz pe 9,6 MHz, ~330 Hz pe 14 MHz). Corecția posibilă: calibrare în ppm în firmware, măsurată automat
 cu SAM pe o stație de radiodifuziune (care emite exact pe grilă).
+
+---
+
+## 10. Corectat 3 oct: orientarea spectrului (USB/LSB)
+
+Până la firmware-ul din 3 oct, Q era negat la intrare, iar spectrul era **în oglindă**: în modul USB placa primea LSB
+și invers (pe ecran, stațiile apăreau pe partea greșită). Găsit prin decodarea FT8 de pe 60 m din IQ-ul înregistrat:
+s-a decodat doar întors. Acum: fără inversare — 16 mesaje FT8 decodate direct (DK7UY, LY8O, OH3JF, T77RN, A65D,
+4L7T, PI4TX, SV1DZB…). Microfonul USB spre WSJT-X primește acum banda corectă.
 

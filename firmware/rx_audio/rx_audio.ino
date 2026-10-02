@@ -69,8 +69,11 @@ enum { MODE_USB, MODE_LSB, MODE_CW, MODE_AM, MODE_FM, MODE_SAM, MODE_N };   // F
 static const char *MODE_NAME[MODE_N] = { "USB", "LSB", "CW", "AM", "FM", "SAM" };
 static volatile uint32_t g_freq = 7074000;
 static volatile int      g_mode = MODE_USB;
-// Radioberry dă spectrul în oglindă față de convenția I+jQ (LSB apărea ca USB): Q se neagă la intrare.
-static volatile bool     g_iq_inv = true;
+// Orientarea spectrului: I+jQ direct (fără negarea lui Q) = frecvențe pozitive = USB. Verificat obiectiv pe 3 oct 2026:
+// FT8 de pe 60 m înregistrat ca IQ se decodează în WSJT-X (jt9) doar așa (12 mesaje); cu Q negat — 0 mesaje.
+// (Inversarea pusă pe 1 oct a fost judecată după ureche, pe când perechea I/Q era încă decalată cu un cadru.)
+// Comanda USB „x” comută orientarea, pentru teste.
+static volatile bool     g_iq_inv = false;
 // butoane pe pinul 18 (vezi keys_read)
 enum { K_NONE, K_SW, K_MOD, K_BAND, K_FILT, K_STEP };
 static volatile bool     g_keys_rc = false;         // rețeaua RC e montată (detectat la pornire)
