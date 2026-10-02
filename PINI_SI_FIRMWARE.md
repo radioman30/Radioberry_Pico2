@@ -199,10 +199,14 @@ cu SAM pe o stație de radiodifuziune (care emite exact pe grilă).
 
 ---
 
-## 10. Corectat 3 oct: orientarea spectrului (USB/LSB)
+## 10. Corectat 3 oct: orientarea spectrului și filtrul SSB
 
-Până la firmware-ul din 3 oct, Q era negat la intrare, iar spectrul era **în oglindă**: în modul USB placa primea LSB
-și invers (pe ecran, stațiile apăreau pe partea greșită). Găsit prin decodarea FT8 de pe 60 m din IQ-ul înregistrat:
-s-a decodat doar întors. Acum: fără inversare — 16 mesaje FT8 decodate direct (DK7UY, LY8O, OH3JF, T77RN, A65D,
-4L7T, PI4TX, SV1DZB…). Microfonul USB spre WSJT-X primește acum banda corectă.
+Erau **două erori care se anulau**:
+1. IQ-ul de la FPGA era folosit cu Q negat → spectrul (ecran, IQ pentru HDSDR) era în oglindă.
+2. Filtrul complex SSB aplica coeficienții de la cel mai vechi eșantion (corelație), deci banda trecută ieșea la −f0:
+   filtrul „USB” lăsa LSB (verificat numeric: tonul USB atenuat 74 dB).
 
+Negarea lui Q (pusă pe 1 oct, după ureche) compensa eroarea 2, dar lăsa spectrul și IQ-ul în oglindă. Acum: Q nenegat +
+filtrul cu faza corectată. **Verificat obiectiv** cu FT8 pe 60 m, prin tot lanțul (demodulare pe placă → microfon USB →
+WSJT-X/jt9): **USB = 7 mesaje decodate într-un interval** (SV3AUW, DK7UY, IK2EST, F5MXH, DG1FK, F6IPR, G0RWF),
+**LSB = 0** (contraproba). IQ-ul brut: 16 mesaje fără nicio oglindire. De confirmat la ascultare: LSB pe 40/80 m.

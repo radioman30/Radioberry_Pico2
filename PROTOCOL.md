@@ -138,7 +138,7 @@ Deci: la fiecare RDY=1 host-ul generează 7 fronturi de ceas și citește 7 × 4
   imagini la nivelul zgomotului; perechea (I din cadrul anterior, Q curent), presupusă inițial, dădea
   corelație 0,54 și imagini doar ~10 dB sub semnal.
   **Orientarea:** I + jQ direct (Q **nenegat**) = frecvențe pozitive = USB. Verificat pe 3 oct 2026 cu FT8 de pe 60 m:
-  IQ-ul înregistrat se decodează în WSJT-X (jt9) doar așa (12–16 mesaje pe interval); cu Q negat, 0 mesaje. Ceasul RX trebuie ținut JOS de dinainte de încărcare (un front în plus după reset decalează
+  IQ-ul înregistrat se decodează în WSJT-X (jt9) doar așa (12–16 mesaje pe interval); cu Q negat, 0 mesaje. (Filtrul SSB din rx_audio avea și el faza inversată; cele două erori se anulau la audio.) Ceasul RX trebuie ținut JOS de dinainte de încărcare (un front în plus după reset decalează
   contoarele up/down). Driverul Pi 4 citește 63 de eșantioane per RDY.
 - **Pini RP2350-PiZero:** BCM 23,20,19,18,16,13,12,5 → GP 23,20,19,18,16,13,9,15; RDY GP25; CLK GP6.
   ⚠️ BCM16 și BCM23 sunt linii de date FPGA → conflict cu pinii I2S aleși înainte pe PiZero (GP16/GP23).

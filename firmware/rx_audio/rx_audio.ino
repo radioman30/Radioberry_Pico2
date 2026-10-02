@@ -193,8 +193,11 @@ static void design_bandpass(int mode) {
   design_lowpass(h, NBP, half, FS);
   for (int k = 0; k < NBP; k++) {
     float ph = 2 * (float)M_PI * f0 * (k - (NBP - 1) / 2.0f) / FS;
+    // dsp_push aplică coeficienții pe buffer de la cel mai VECHI eșantion la cel mai nou (corelație, nu convoluție),
+    // deci faza se ia cu semn schimbat ca banda trecută să fie la +f0. Cu +sin, filtrul „USB” lăsa LSB și invers
+    // (verificat numeric 3 oct: +1000 Hz atenuat 74 dB). Eroarea era compensată greșit prin negarea lui Q.
     hb_r[k] = h[k] * cosf(ph);
-    hb_i[k] = h[k] * sinf(ph);
+    hb_i[k] = -h[k] * sinf(ph);
   }
 }
 
