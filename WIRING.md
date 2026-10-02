@@ -65,8 +65,8 @@ Sursa: netlist-ul Radioberry (`hardware/radio/Radioberry.net`, CN302 ↔ FPGA U1
 **Pe modulul PCM5102A:** SCK → GND, XSMT → 3V3, FLT / DEMP / FMT → GND (jumperii de pe spate).
 Căștile intră în mufa jack a modulului.
 
-**Encoder:** pull-up intern, contactele spre GND (comunul la pinul 14). Dacă modulul are pin „+",
-lasă-l nelegat sau pune-l la 3V3, niciodată la 5V. Nu ține apăsat encoderul când pornești placa
+**Encoder:** pull-up intern, contactele spre GND (comunul la pinul 14). Pinul „+" al modulului
+rămâne **nelegat** (pull-up-urile lui de 10 kΩ încurcă butoanele de pe pinul 18, §0.6). Nu ține apăsat encoderul când pornești placa
 (pinul 18 servește întâi la încărcarea FPGA-ului).
 
 **Comenzi (encoder):** rotire = schimbă parametrul evidențiat; apăsare scurtă = parametrul următor

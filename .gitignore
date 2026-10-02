@@ -23,3 +23,7 @@ gateware/
 # inregistrari IQ (mari)
 iq_rec/
 *.wav
+
+# firmware compilat (contine gateware tert)
+release/
+*.uf2

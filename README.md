@@ -23,7 +23,7 @@ waterfall pe OLED-ul 128x64, encoder cu meniu, benzi cu memorie, filtre selectab
 2. **Compilare:** arduino-pico (core `rp2040:rp2040` 5.x), placa `waveshare_rp2350_pizero`, biblioteca U8g2,
    stiva USB **Adafruit TinyUSB** + flag-urile pentru microfonul USB — totul în
    `powershell -File toolsuild_rx_audio.ps1 [-Flash]`.
-3. **Cablaj:** [`WIRING.md`](WIRING.md) §0.5 (header complet, PCM5102A, OLED, encoder) și §0.6 (butoane pe un pin).
+3. **Cablaj:** rezumatul complet, cu istoricul modificărilor de pini, în [`PINI_SI_FIRMWARE.md`](PINI_SI_FIRMWARE.md); detalii în [`WIRING.md`](WIRING.md) §0.5 (header complet, PCM5102A, OLED, encoder) și §0.6 (butoane pe un pin).
 4. **Protocolul** și capcanele (bit DUPLEX, câștig RX, ordinea octeților, SPI mode 3): [`PROTOCOL.md`](PROTOCOL.md) §6.
 
 **Pe USB, placa apare ca:** port serial (comenzi) + **microfon „Radioberry RX audio"** (48 kHz mono, audio
