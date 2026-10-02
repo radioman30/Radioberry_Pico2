@@ -168,3 +168,18 @@ trebuie să fie sub 32. Din schema PiZero: USB-C secundar (PIO-USB) = **D+ GPIO2
 slotul microSD = GPIO30, 31, 40–43 (40–43 sunt peste 31, nepotrivite); mini-HDMI = GPIO32–39, 44–46.
 Acces la GPIO28: un cablu/adaptor USB-C tăiat (D+ = de obicei firul verde) sau direct pe pad-ul lui R8.
 USB-C-ul secundar nu mai poate fi folosit ca USB host după asta.
+
+---
+
+## 8. Plănuit: test TX (după WM8960)
+
+- **Sursa audio de emisie:** microfonul WM8960 (ADCDAT pe GPIO28), apoi modulare SSB/CW/AM/FM în RP2350.
+- **Calea spre FPGA în gateware 73.x:** eșantioanele TX merg pe **SPI** (commit PA3GSB „73.2 8bits rx + tx spi”),
+  probabil pe **CE1 (GP7, pin 26)**, care e deja legat. De extras exact din driverul Pi 4
+  (`rb2-tx-stream.c`, `rb2-trx-control.c`) înainte de orice test. Varianta PIO (75.x, Pi 5) ar folosi
+  BCM 12/5/4 (TX_RDY/TX_DATA/TX_CLK), ocupați la noi de date RX și I2S, deci nu se potrivește.
+- **Siguranță la primul test:** sarcină artificială de 50 Ω, fără amplificator extern, putere minimă
+  (comanda de drive), PTT cu timp maxim de emisie în firmware.
+- **Gateware:** rămânem pe 73.3 / 73.4. Verificat 3 oct: nici HL2 `gateware/bitfiles` (Radioberry doar 71.3 din 2020;
+  74.x e doar pentru plăcile HL2), nici arhiva release `radioberry@rpi5` (dec 2025) nu au ceva mai nou.
+
