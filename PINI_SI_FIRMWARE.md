@@ -209,4 +209,4 @@ Erau **două erori care se anulau**:
 Negarea lui Q (pusă pe 1 oct, după ureche) compensa eroarea 2, dar lăsa spectrul și IQ-ul în oglindă. Acum: Q nenegat +
 filtrul cu faza corectată. **Verificat obiectiv** cu FT8 pe 60 m, prin tot lanțul (demodulare pe placă → microfon USB →
 WSJT-X/jt9): **USB = 7 mesaje decodate într-un interval** (SV3AUW, DK7UY, IK2EST, F5MXH, DG1FK, F6IPR, G0RWF),
-**LSB = 0** (contraproba). IQ-ul brut: 16 mesaje fără nicio oglindire. De confirmat la ascultare: LSB pe 40/80 m.
+**LSB = 0** (contraproba). IQ-ul brut: 16 mesaje fără nicio oglindire. Confirmat la ascultare (3 oct): LSB se aude bine.
