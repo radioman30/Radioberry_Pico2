@@ -213,3 +213,14 @@ Negarea lui Q (pusă pe 1 oct, după ureche) compensa eroarea 2, dar lăsa spect
 filtrul cu faza corectată. **Verificat obiectiv** cu FT8 pe 60 m, prin tot lanțul (demodulare pe placă → microfon USB →
 WSJT-X/jt9): **USB = 7 mesaje decodate într-un interval** (SV3AUW, DK7UY, IK2EST, F5MXH, DG1FK, F6IPR, G0RWF),
 **LSB = 0** (contraproba). IQ-ul brut: 16 mesaje fără nicio oglindire. Confirmat la ascultare (3 oct): LSB se aude bine.
+
+---
+
+## 11. WSJT-X (FT8) — configurare verificată 3 oct
+
+File → Settings → **Radio**: Rig **Kenwood TS-2000**, port **COM12**, 115200, Data/Stop **8/1**, Handshake **None**,
+Force Control Lines: **DTR High** (RTS nebifat), PTT **VOX**, **Mode: USB** (WSJT-X trece placa pe USB la fiecare
+bandă — modurile digitale se lucrează pe USB și pe 40/80 m), Split **None**.
+**Audio**: Input **Microphone (Radioberry RX audio)**. Pe placă: filtru **2,7 kHz**. Squelch-ul nu afectează WSJT-X.
+Rezultat: decodează FT8 pe 60 m și 40 m, frecvența citită prin CAT.
+
