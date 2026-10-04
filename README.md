@@ -194,8 +194,9 @@ pe placă filtru 2,7 kHz.
 
 ## COMPILARE ȘI SCRIERE PE PLACĂ
 
-**Cu fișier UF2 gata făcut:** ține **BOOT** apăsat, conectează USB, copiază `.uf2` pe discul
-**RP2350** care apare. Placa repornește singură.
+**Cu fișier UF2 gata făcut:** descarcă `.uf2` din
+[**Releases**](https://github.com/radioman30/Radioberry_Pico2/releases) (include gateware-ul FPGA),
+ține **BOOT** apăsat, conectează USB, copiază `.uf2` pe discul **RP2350** care apare. Placa repornește singură.
 
 **Din sursă:**
 1. **Gateware** (binar terț, nu e în repo): `radioberry.rbf` PIO 75.2 din
