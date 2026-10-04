@@ -2,6 +2,11 @@
 
 **Receptor SDR HF standalone: Radioberry v2 + RP2350, fără Linux, fără PC.**
 
+![Radioberry_Pico2 — LSB pe 80 m, spectru și waterfall pe OLED, panou în carcasă printată](docs/receptor.jpg)
+
+*Radioberry v2 (cu ventilator) pe RP2350-PiZero, PCM5102A în dreapta, panoul cu OLED și encoder în
+carcasă printată 3D — recepție LSB pe 3,674 MHz.*
+
 Radioberry_Pico2 este un receptor HF experimental construit în jurul plăcii **Radioberry v2 (CL025)**
 înfipte direct într-un **Waveshare RP2350-PiZero**.
 
