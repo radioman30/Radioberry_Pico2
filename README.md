@@ -7,6 +7,8 @@
 *Radioberry v2 (cu ventilator) pe RP2350-PiZero, PCM5102A în dreapta, panoul cu OLED și encoder în
 carcasă printată 3D — recepție LSB pe 3,674 MHz.*
 
+▶ **[Video, 27 s — recepție LSB pe 40 m, cu sunet](docs/receptor.mp4)**
+
 Radioberry_Pico2 este un receptor HF experimental construit în jurul plăcii **Radioberry v2 (CL025)**
 înfipte direct într-un **Waveshare RP2350-PiZero**.
 
