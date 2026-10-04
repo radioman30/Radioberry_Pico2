@@ -5,7 +5,7 @@
 // Radioberry folosește GPIO-urile BCM ale header-ului Pi (driverul PA3GSB pio-mode, PROTOCOL.md).
 // Pe PiZero, maparea header -> GPIO e din schema Waveshare (WIRING.md §0.3); nu e 1:1 la
 // SPI (BCM 9/10/11 -> GP12/11/10 = SPI1 hardware), BCM 4/5/12/14/15 -> GP14/15/9/4/5.
-// Fișierul e identic în firmware/rb_bringup și firmware/audio_test — ține-le sincronizate.
+// Fișierul e identic în firmware/rb_bringup, firmware/rb_bringup_pio și firmware/audio_test — ține-le sincronizate.
 #pragma once
 
 #if defined(ARDUINO_WAVESHARE_RP2350_PIZERO)

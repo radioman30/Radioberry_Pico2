@@ -1,8 +1,9 @@
 // rx_audio — receptor SSB/CW/AM: Radioberry v2 (CL025) + Waveshare RP2350-PiZero + PCM5102A
 //
-// Lanț: FPGA (gateware Hermes-Lite 2 radioberry_cl025 73.3, protocol clasic Pi 4) -> IQ 48 kHz
+// Lanț: FPGA (gateware PIO 75.2 din RagchewBerry/WP3DN, 4 linii + meta, citit cu PIO + DMA) -> IQ 48 kHz
 //       -> decimare /4 (12 kHz) -> filtru complex trece-bandă -> demodulare -> AGC -> I2S 12 kHz.
-// Protocol și capcane: PROTOCOL.md §6. Doar pe RP2350-PiZero (Radioberry înfipt în header).
+// Protocol și capcane: PROTOCOL.md §7 (§6 = vechiul protocol clasic pe 8 linii, gateware HL2 73.3).
+// Doar pe RP2350-PiZero (Radioberry înfipt în header).
 //
 // UI (meniu cu un singur buton): apăsare scurtă = parametrul următor (FRECV > PAS > MOD > FILTRU > BANDA > VOL > GAIN);
 //     rotire = schimbă parametrul evidențiat; apăsare lungă sau 6 s fără atingere = înapoi la FRECV.
@@ -13,7 +14,7 @@
 // Setările (frecvență, mod, pas, filtre, volum, câștig, memoria benzilor) se salvează în flash la 5 s
 //     după ultima schimbare și se reîncarcă la pornire.
 // CAT: emulare Kenwood TS-2000 pe același port (comenzi cu „;”): WSJT-X, fldigi, Omni-Rig/HDSDR.
-// USB (115200): s stare | f<Hz> frecvența | m<0-5> modul (USB LSB CW AM FM SAM) | l<dBFS> squelch (l0 = oprit) | n<0-3> reducere zgomot | c calibrare automată (în SAM, pe o stație AM) | c<ppb> calibrare manuală | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
+// USB (115200): s stare | f<Hz> frecvența | m<0-5> modul (USB LSB CW AM FM SAM) | l<dB> squelch: prag în dB peste zgomotul estimat, 1..40 (l0 = oprit) | n<0-3> reducere zgomot | c calibrare automată (în SAM, pe o stație AM) | c<ppb> calibrare manuală | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -28,6 +29,8 @@
 struct Settings;                    // definită mai jos; aici doar pt. prototipurile generate de Arduino
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
+#include "hardware/pio.h"
+#include "hardware/dma.h"
 #include "gateware_cl025.h"
 
 #if !defined(ARDUINO_WAVESHARE_RP2350_PIZERO)
@@ -35,19 +38,22 @@ struct Settings;                    // definită mai jos; aici doar pt. prototip
 #endif
 
 // ============================================================
-// Pini RP2350-PiZero cu Radioberry înfipt (protocol clasic). „hdr" = pinul fizic al header-ului.
+// Pini RP2350-PiZero cu Radioberry înfipt (gateware PIO). „hdr" = pinul fizic al header-ului.
 // Liberi de FPGA (netlist Radioberry.net): BCM 0,1,2,3,14,15 (+BCM4 intrare FPGA nefolosită,
 // +BCM24/DCLK după configurare). INTERZIS: BCM17, BCM21 (ieșiri FPGA pi_cwl/pi_cwr).
+// Față de protocolul clasic nu mai sunt linii de date RX: BCM 5, 12, 13, 16, 23 (GP 15, 9, 13, 16, 23).
+// Rămân intrări până se confirmă că gateware-ul PIO nu le comandă.
 // ============================================================
 //                                   GP   BCM hdr
 #define PIN_FPGA_NCONFIG   27   //  27   27  13
-#define PIN_FPGA_DATA0     13   //  13   13  33  (după configurare = linie de date RX)
+#define PIN_FPGA_DATA0     13   //  13   13  33
 #define PIN_FPGA_DCLK      24   //  24   24  18  (după configurare = apăsarea encoderului)
 #define PIN_FPGA_NSTATUS   26   //  26   26  37
 #define PIN_FPGA_CONFDONE  22   //  22   22  15
-#define PIN_RX_CLK          6   //   6    6  31
-#define PIN_RX_RDY         25   //  25   25  22
-static const uint8_t RX_GP[8] = { 23, 20, 19, 18, 16, 13, 9, 15 };   // BCM 23,20,19,18,16,13,12,5
+#define PIN_RX_CLK          6   //   6    6  31   ceas RX (side-set PIO)
+#define PIN_RX_RDY         25   //  25   25  22   RDY (jmp pin PIO)
+#define PIN_RX_D0          18   //  18   18  12   date RX D0..D3 = GP18..21 (consecutivi, in pins PIO)
+static const uint8_t FREED_GP[5] = { 15, 9, 13, 16, 23 };              // foste linii de date clasice
 #define PIN_SPI_SCK        10   //  10   11  23   (SPI1 hardware)
 #define PIN_SPI_MOSI       11   //  11   10  19
 #define PIN_SPI_MISO       12   //  12    9  21
@@ -69,10 +75,11 @@ enum { MODE_USB, MODE_LSB, MODE_CW, MODE_AM, MODE_FM, MODE_SAM, MODE_N };   // F
 static const char *MODE_NAME[MODE_N] = { "USB", "LSB", "CW", "AM", "FM", "SAM" };
 static volatile uint32_t g_freq = 7074000;
 static volatile int      g_mode = MODE_USB;
-// Orientarea spectrului: I+jQ direct (fără negarea lui Q) = frecvențe pozitive = USB. Verificat obiectiv pe 3 oct 2026:
-// FT8 de pe 60 m înregistrat ca IQ se decodează în WSJT-X (jt9) doar așa (12 mesaje); cu Q negat — 0 mesaje.
-// (Inversarea pusă pe 1 oct a fost judecată după ureche, pe când perechea I/Q era încă decalată cu un cadru.)
-// Comanda USB „x” comută orientarea, pentru teste.
+// Orientarea spectrului — convenția firmware-ului: frecvențe pozitive = USB (verificată cu FT8 în jt9, 3 oct 2026).
+// Gateware-ul HL2 73.3 o dădea direct (I + jQ); gateware-ul PIO 75.2 dă spectrul INVERS (purtătoarea de pe
+// 9640 kHz apare la -3193 Hz cu acord pe 9637 kHz, PROTOCOL.md §7) -> Q se neagă la citire (RB_Q_NEG).
+// Comanda USB „x” comută în plus orientarea, pentru teste.
+static const bool        RB_Q_NEG = true;
 static volatile bool     g_iq_inv = false;
 // Calibrarea frecvenței: eroarea ceasului Radioberry, în ppb (+ = placa recepționa mai sus decât afișa).
 // Măsurat 3 oct: ~+23 ppm (stațiile de pe 9640/9630 kHz apăreau cu 222 Hz sub centru).
@@ -91,6 +98,7 @@ static const char *KEY_NAME[] = { "-", "ENCODER", "MOD", "BANDA", "FILTRU", "PAS
 static volatile int      g_vol = 30;                // 0..100
 static volatile int      g_gain_db = 20;            // câștig LNA AD9866: -12..+48 dB
 static volatile bool     g_gain_dirty = false;
+static int               g_gain_sent = 0;           // câștigul trimis efectiv la FPGA (pentru squelch)
 static volatile bool     g_freq_dirty = true, g_mode_dirty = true;
 static volatile int      g_fpga = 0;                // 1 = OK
 static volatile uint8_t  g_gw_major = 0, g_gw_minor = 0;
@@ -122,7 +130,7 @@ static int fpga_load() {
   if (!gpio_get(PIN_FPGA_NSTATUS) || !gpio_get(PIN_FPGA_CONFDONE)) return -1;
   gpio_put(PIN_FPGA_DCLK, 1); gpio_put(PIN_FPGA_DCLK, 0);
   gpio_put(PIN_FPGA_DCLK, 1); gpio_put(PIN_FPGA_DCLK, 0);
-  gpio_set_dir(PIN_FPGA_DATA0, GPIO_IN);            // BCM13 devine linie de date RX
+  gpio_set_dir(PIN_FPGA_DATA0, GPIO_IN);            // BCM13 nu mai e folosit după configurare
   gpio_set_dir(PIN_FPGA_DCLK, GPIO_IN);             // BCM24 devine butonul encoderului
   gpio_pull_up(PIN_FPGA_DCLK);
   return 1;
@@ -132,8 +140,9 @@ static int fpga_load() {
 // SPI control: mod 3, 6 octeți [stare, C0, C1..C4]; răspuns: [4].[5] = versiune
 // ============================================================
 static const uint32_t RB_REG0 = 0x00000004;         // 48 kHz, 1 RX, DUPLEX=1 (altfel RX1 = frecv. TX)
-// Câștig RX: adresa 0x0A (C0 = 0x14), cmd_data[6:0] = 0x40 | (dB + 12). La pornire gateware-ul e pe
-// 0x40 = -12 dB (minimul) -> fără comanda asta receptorul e practic surd (ad9866ctrl.v).
+// Câștig RX: adresa 0x0A (C0 = 0x14), cmd_data[6:0] = 0x40 | (dB + 12). Gateware-ul HL2 pornea pe -12 dB
+// (surd fără comandă), cel PIO pornește pe câștig mare (~-47 dBFS cu antena) -> comanda se trimite la
+// pornire și se retrimite ciclic, ca valoarea aleasă să fie mereu cea efectivă.
 static inline uint32_t rb_gain_word() { return 0x40u | (uint32_t)(g_gain_db + 12); }
 static void rb_cmd(uint8_t c0, uint32_t data) {
   uint8_t tx[6] = { 0x05, c0, (uint8_t)(data >> 24), (uint8_t)(data >> 16), (uint8_t)(data >> 8), (uint8_t)data }, rx[6];
@@ -213,24 +222,53 @@ static void design_bandpass(int mode) {
 // Squelch, reducere de zgomot, AM sincron. Ideile vin din PicoRX (github.com/dawsonjon/PicoRX, MIT,
 // © 2024 Jonathan P Dawson); aici rescrise în virgulă mobilă pentru lanțul nostru de 12 kHz.
 // ============================================================
-static volatile int  g_sql = 0;                      // 0 = oprit; altfel pragul de deschidere în dBFS (-130..-40)
+static volatile int  g_sql = 0;                      // 0 = oprit; altfel pragul de deschidere în dB PESTE ZGOMOT (1..40)
+static const int     SQL_MAX = 40;
 static volatile int  g_nr = 0;                       // 0 = oprit; 1..3 = tăria reducerii de zgomot
 static volatile bool g_sq_open = true;               // pentru ecran
+static volatile float g_sq_nf = -140;                // zgomotul estimat în banda filtrului, dBFS (ecran / stare)
 
-// Squelch: nivelul din banda filtrului, netezit ~17 ms; deschide peste prag, închide la 3 dB sub prag
-// după 250 ms de reținere (să nu taie între cuvinte). Poarta se deschide/închide lin (~20 ms), fără clicuri.
-static float sq_pow = 1e-12f, sq_gate = 1;
+// Squelch relativ la zgomot: nivelul din banda filtrului, netezit ~17 ms, se compară cu zgomotul estimat + prag.
+// Pragul fix în dBFS (până pe 3 oct) depindea de câștig și de bandă: la câștig mic zgomotul trecea peste el și
+// squelch-ul pâlpâia. Zgomotul = „minimum statistics": media puterii pe blocuri de 0,1 s, apoi minimul ultimelor
+// 8 s (80 de blocuri) — urmărește media zgomotului, nu golurile lui; coboară instant, urcă în ≤8 s. Cu 3 s,
+// o stație care vorbea continuu devenea „zgomot" și își închidea singură squelch-ul (măsurat pe 40 m). Pe SSB/CW e
+// suficient (vorbirea și manipularea au pauze). Pe AM/SAM/FM purtătoarea e continuă: cât squelch-ul e deschis,
+// estimarea urcă doar cu 0,5 dB/s, ca purtătoarea să nu-și închidă singură squelch-ul. La schimbarea frecvenței,
+// câștigului LNA estimarea se mută exact cu diferența (sq_gain_shift), fără să mai aștepte.
+// Deschide peste zgomot + prag, închide la 3 dB sub, după 250 ms de reținere (să nu taie între cuvinte).
+// Poarta se deschide/închide lin (~20 ms), fără clicuri.
+#define SQ_NB 80
+static float sq_pow = 1e-12f, sq_gate = 1, sq_nf = 0;
+static float sq_blk[SQ_NB], sq_acc = 0; static int sq_acc_n = 0, sq_bi = 0, sq_bn = 0;
+static volatile int sq_gain_shift = 0;            // dB de adăugat estimării (schimbare de câștig)
 static int sq_hang = 0;
+static void squelch_noise(float p) {
+  int sh = sq_gain_shift;
+  if (sh) { sq_gain_shift -= sh; for (int k = 0; k < sq_bn; k++) sq_blk[k] += sh; sq_nf += sh; g_sq_nf = sq_nf; }
+  sq_acc += p;
+  if (++sq_acc_n < FS / 10) return;
+  sq_blk[sq_bi] = 10 * log10f(sq_acc / sq_acc_n + 1e-20f);
+  sq_bi = (sq_bi + 1) % SQ_NB; if (sq_bn < SQ_NB) sq_bn++;
+  sq_acc = 0; sq_acc_n = 0;
+  float m = sq_blk[0];
+  for (int k = 1; k < sq_bn; k++) if (sq_blk[k] < m) m = sq_blk[k];
+  bool carrier = g_mode == MODE_AM || g_mode == MODE_SAM || g_mode == MODE_FM;
+  if (sq_bn == 1 || m <= sq_nf || !(carrier && g_sq_open && g_sql)) sq_nf = m;
+  else sq_nf = fminf(m, sq_nf + 0.05f);              // 0,5 dB/s (10 blocuri/s)
+  g_sq_nf = sq_nf;
+}
 static float squelch_gate(float p) {
   sq_pow += 0.005f * (p - sq_pow);
+  float lvl = 10 * log10f(sq_pow + 1e-20f);
+  squelch_noise(p);
   int thr = g_sql;
   bool open = g_sq_open;
   if (!thr) open = true;
   else {
-    float lvl = 10 * log10f(sq_pow + 1e-20f);
-    if (lvl > thr) { open = true; sq_hang = FS / 4; }
+    if (lvl > sq_nf + thr) { open = true; sq_hang = FS / 4; }
     else if (sq_hang > 0) sq_hang--;
-    else if (lvl < thr - 3) open = false;
+    else if (lvl < sq_nf + thr - 3) open = false;
   }
   g_sq_open = open;
   sq_gate += ((open ? 1.0f : 0.0f) - sq_gate) * 0.004f;
@@ -407,12 +445,78 @@ static void audio_out_pump() {
 }
 
 // ============================================================
-// RX clasic: RDY -> 63 eșantioane × 6 octeți (Q anterior hi,mid,lo | I hi,mid,lo)
+// RX PIO: cât timp RDY e sus, PIO-ul scoate cuvinte de 28 biți = meta (4) + eșantion cu semn (24),
+// câte un nibble pe 7 fronturi ale ceasului RX. 1 receptor: meta 0 = I, apoi meta 1 = Q din aceeași
+// pereche. Programul e al PA3GSB, identic cu rb-rx.pio din RagchewBerry; DMA ping-pong în RAM.
 // ============================================================
-static inline uint8_t rx_byte(uint32_t a) {
-  return (uint8_t)((((a >> 23) & 1) << 7) | (((a >> 20) & 1) << 6) | (((a >> 19) & 1) << 5) |
-                   (((a >> 18) & 1) << 4) | (((a >> 16) & 1) << 3) | (((a >> 13) & 1) << 2) |
-                   (((a >>  9) & 1) << 1) |  ((a >> 15) & 1));
+static const uint16_t rx_iq_program_instr[] = {
+  0x000f,  //  0: jmp    15
+  0xbb42,  //  1: nop           side 1 [3]
+  0x5004,  //  2: in pins, 4    side 0         <- meta
+  0xbb42, 0x5004, 0xbb42, 0x5004, 0xbb42, 0x5004,
+  0xbb42, 0x5004, 0xbb42, 0x5004, 0xbb42, 0x5004,   // 3..14: 6 nibble-uri = 24 biți eșantion
+  0xba42,  // 15: nop           side 1 [2]
+  0xb242,  // 16: nop           side 0 [2]
+  0x00c1,  // 17: jmp pin, 1    (RDY=1 -> citește un cuvânt)
+};
+static const struct pio_program rx_iq_program = { .instructions = rx_iq_program_instr, .length = 18, .origin = -1 };
+
+static PIO  rx_pio;
+static uint rx_sm;
+static int  rx_dma = -1;
+// Un singur canal DMA, fără întreruperi: scrie la nesfârșit (TRANS_COUNT „endless", RP2350) într-un inel de
+// 32 KB aliniat (ring pe adresa de scriere). Bucla principală citește adresa curentă de scriere a DMA-ului și
+// procesează tot ce s-a adunat. Fără IRQ și fără re-armare: un handler pe DMA_IRQ_1 bloca firmware-ul (3 oct).
+// 8192 cuvinte = 4096 perechi = 85 ms de rezervă (acoperă și scrierea setărilor în flash).
+#define RX_RING_BITS  15
+#define RX_RING_WORDS (1u << (RX_RING_BITS - 2))
+static uint32_t rx_ring[RX_RING_WORDS] __attribute__((aligned(1u << RX_RING_BITS)));
+static uint32_t rx_rd = 0;                           // următorul cuvânt de citit (index în inel)
+static volatile uint32_t g_rx_overrun = 0;           // de câte ori DMA-ul a ajuns din urmă cititorul
+static uint32_t g_rx_sync_err = 0;
+
+static bool rx_pio_start() {
+  // I2S-ul (pornit înainte) are deja un PIO; se ia primul bloc cu loc și un state machine liber
+  PIO pios[] = { pio0, pio1, pio2 };
+  int off = -1, sm = -1;
+  for (PIO p : pios) {
+    if (!pio_can_add_program(p, &rx_iq_program)) continue;
+    sm = pio_claim_unused_sm(p, false);
+    if (sm < 0) continue;
+    rx_pio = p; off = pio_add_program(p, &rx_iq_program);
+    break;
+  }
+  if (off < 0) return false;
+  rx_sm = (uint)sm;
+
+  pio_sm_config c = pio_get_default_sm_config();
+  sm_config_set_wrap(&c, off, off + 17);
+  sm_config_set_sideset(&c, 2, true, false);        // 1 bit + „opt"
+  sm_config_set_sideset_pins(&c, PIN_RX_CLK);
+  sm_config_set_in_pins(&c, PIN_RX_D0);
+  sm_config_set_jmp_pin(&c, PIN_RX_RDY);
+  sm_config_set_in_shift(&c, false, true, 28);      // stânga, autopush la 28 biți
+  sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+  sm_config_set_clkdiv_int_frac(&c, 2, 0);          // ca la RagchewBerry; verificat 48 128 perechi/s, 0 erori
+
+  pio_sm_set_pins_with_mask(rx_pio, rx_sm, 0, 1u << PIN_RX_CLK);   // ceasul rămâne jos la predare
+  pio_gpio_init(rx_pio, PIN_RX_CLK);
+  pio_sm_set_consecutive_pindirs(rx_pio, rx_sm, PIN_RX_CLK, 1, true);
+  for (int p = PIN_RX_D0; p < PIN_RX_D0 + 4; p++) pio_gpio_init(rx_pio, p);
+  pio_sm_set_consecutive_pindirs(rx_pio, rx_sm, PIN_RX_D0, 4, false);
+  pio_sm_init(rx_pio, rx_sm, off, &c);
+
+  if ((rx_dma = dma_claim_unused_channel(false)) < 0) return false;
+  dma_channel_config dc = dma_channel_get_default_config(rx_dma);
+  channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+  channel_config_set_read_increment(&dc, false);
+  channel_config_set_write_increment(&dc, true);
+  channel_config_set_ring(&dc, true, RX_RING_BITS);  // adresa de scriere se învârte în inel
+  channel_config_set_dreq(&dc, pio_get_dreq(rx_pio, rx_sm, false));
+  dma_channel_configure(rx_dma, &dc, rx_ring, &rx_pio->rxf[rx_sm], dma_encode_endless_transfer_count(), true);
+  rx_rd = 0;
+  pio_sm_set_enabled(rx_pio, rx_sm, true);
+  return true;
 }
 static uint32_t cnt_iq = 0;
 
@@ -452,29 +556,36 @@ static void iqb_pump() {
   }
 }
 
+static void rx_pair(int32_t i, int32_t q) {
+  if (RB_Q_NEG != g_iq_inv) q = -q;                  // convenția firmware-ului: +f = USB
+  float out;
+  float fi = i / 8388608.0f, fq = q / 8388608.0f;
+  if (dsp_push(fi, fq, &out)) { audio_out_push(out); usb_audio_push12k(g_dsp_raw); }
+  if (cap_req) {
+    cap_i[cap_n] = fi; cap_q[cap_n] = fq;
+    if (++cap_n >= FFT_N) { cap_n = 0; __dmb(); cap_req = false; cap_ready = true; }
+  }
+  if (g_stream) iqb_push(i, q);                      // aceeași convenție ca spectrul
+  cnt_iq++;
+}
+
 static void rx_poll() {
-  if (!gpio_get(PIN_RX_RDY)) return;
-  for (int s = 0; s < 63; s++) {
-    uint8_t b[6];
-    for (int i = 0; i < 6; i++) {
-      gpio_put(PIN_RX_CLK, (i & 1) ? 0 : 1);
-      busy_wait_at_least_cycles(15);                 // ~100 ns
-      b[i] = rx_byte(gpio_get_all());
-    }
-    int32_t q = (int32_t)(((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8)) >> 8;
-    int32_t i = (int32_t)(((uint32_t)b[3] << 24) | ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 8)) >> 8;
-    // Perechea corectă e I și Q din ACELAȘI cadru. Verificat pe o înregistrare IQ (2 oct 2026):
-    // (I[n],Q[n]) -> corelație I/Q 0,00, imagini la nivelul zgomotului; (I[n-1],Q[n]), folosit până
-    // atunci -> corelație 0,54 și imagini doar ~10 dB sub semnal (bandă laterală opusă slab suprimată).
-    float out;
-    float fi = i / 8388608.0f, fq = (g_iq_inv ? -q : q) / 8388608.0f;
-    if (dsp_push(fi, fq, &out)) { audio_out_push(out); usb_audio_push12k(g_dsp_raw); }
-    if (cap_req) {
-      cap_i[cap_n] = fi; cap_q[cap_n] = fq;
-      if (++cap_n >= FFT_N) { cap_n = 0; __dmb(); cap_req = false; cap_ready = true; }
-    }
-    if (g_stream) iqb_push(i, g_iq_inv ? -q : q);   // aceeași convenție ca spectrul: +f = USB
-    cnt_iq++;
+  static bool synced = false;
+  static int32_t cur_i = 0;
+  if (rx_dma < 0) return;
+  // poziția de scriere a DMA-ului în inel (cuvântul la care va scrie următorul)
+  uint32_t wr = ((uint32_t)dma_channel_hw_addr(rx_dma)->write_addr - (uint32_t)rx_ring) / 4 % RX_RING_WORDS;
+  uint32_t avail = (wr - rx_rd) % RX_RING_WORDS;
+  if (avail > RX_RING_WORDS * 3 / 4) g_rx_overrun++;   // cititorul a rămas periculos de în urmă
+  if (avail > 1024) avail = 1024;                    // cel mult 512 perechi per apel: audio și USB nu așteaptă
+  while (avail--) {
+    uint32_t w = rx_ring[rx_rd];
+    rx_rd = (rx_rd + 1) % RX_RING_WORDS;
+    uint32_t meta = (w >> 24) & 0x0F;
+    int32_t s = (int32_t)(w << 8) >> 8;              // extensie de semn pe 24 biți
+    if (meta == 0) { cur_i = s; synced = true; }
+    else if (meta == 1 && synced) { rx_pair(cur_i, s); synced = false; }
+    else { g_rx_sync_err++; synced = false; }        // Q fără I înainte, sau meta necunoscut
   }
 }
 
@@ -483,8 +594,9 @@ static void rx_poll() {
 // ============================================================
 static void radio_start() {
   gpio_init(PIN_RX_CLK); gpio_set_dir(PIN_RX_CLK, GPIO_OUT); gpio_put(PIN_RX_CLK, 0);  // jos ÎNAINTE de încărcare
-  gpio_init(PIN_RX_RDY); gpio_set_dir(PIN_RX_RDY, GPIO_IN); gpio_pull_up(PIN_RX_RDY);
-  for (int k = 0; k < 8; k++) { gpio_init(RX_GP[k]); gpio_set_dir(RX_GP[k], GPIO_IN); }
+  gpio_init(PIN_RX_RDY); gpio_set_dir(PIN_RX_RDY, GPIO_IN);
+  for (int k = 0; k < 4; k++) { gpio_init(PIN_RX_D0 + k); gpio_set_dir(PIN_RX_D0 + k, GPIO_IN); }
+  for (uint8_t p : FREED_GP) { gpio_init(p); gpio_set_dir(p, GPIO_IN); }
   gpio_init(PIN_FPGA_NCONFIG);  gpio_set_dir(PIN_FPGA_NCONFIG, GPIO_OUT); gpio_put(PIN_FPGA_NCONFIG, 1);
   gpio_init(PIN_FPGA_DATA0);    gpio_set_dir(PIN_FPGA_DATA0, GPIO_OUT);
   gpio_init(PIN_FPGA_DCLK);     gpio_set_dir(PIN_FPGA_DCLK, GPIO_OUT);
@@ -501,8 +613,10 @@ static void radio_start() {
 
   g_fpga = fpga_load();
   if (g_fpga == 1) {
-    delay(200);                                      // ieșirea din reset înainte de primul cadru SPI
+    delay(500);                                      // ieșirea din reset înainte de primul cadru SPI (ca RagchewBerry)
     rb_cmd(0x00, RB_REG0); rb_cmd(0x02, rb_freq()); rb_cmd(0x04, rb_freq()); rb_cmd(0x14, rb_gain_word());
+    g_gain_sent = g_gain_db;
+    if (!rx_pio_start()) g_fpga = -3;               // fără PIO/DMA liber: niciun eșantion
   }
   g_ui_ready = true;
 }
@@ -674,7 +788,7 @@ static void handle_cmd(const char *s) {
   }
   if (s[0] == 'm' && v >= 0 && v < MODE_N)        { g_mode = v; g_mode_dirty = true; }
   if (s[0] == 'v' && v >= 0 && v <= 100)          g_vol = v;
-  if (s[0] == 'l' && (v == 0 || (v >= -130 && v <= -40))) g_sql = v;
+  if (s[0] == 'l' && v >= 0 && v <= SQL_MAX)     g_sql = v;
   if (s[0] == 'n' && v >= 0 && v <= 3)            g_nr = v;
   if (s[0] == 'c') {
     if (s[1] == 0) {                                 // automat: decalajul măsurat de PLL-ul SAM pe o stație AM
@@ -689,11 +803,12 @@ static void handle_cmd(const char *s) {
     return;
   }
   if (s[0] == 'g' && v >= -12 && v <= 48)         { g_gain_db = v; g_gain_dirty = true; }
-  Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s | S %.1f dBFS | drop %lu under %lu | mic USB %s (aruncate %lu) | SQL %d %s | NR %d | SAM %+.0f Hz\n",
-                g_fpga == 1 ? "OK" : "ERR", g_gw_major, g_gw_minor, (unsigned long)g_freq, MODE_NAME[g_mode],
-                g_vol, g_gain_db, (unsigned long)g_iq_rate, g_smeter_db, (unsigned long)g_audio_drop, (unsigned long)g_audio_under,
+  Serial.printf("FPGA %s gw %u.%u | %lu Hz %s vol %d gain %+d dB | IQ %lu/s sync err %lu ovr %lu | S %.1f dBFS | drop %lu under %lu | mic USB %s (aruncate %lu) | SQL +%d dB (zgomot %.1f dBFS) %s | NR %d | SAM %+.0f Hz\n",
+                g_fpga == 1 ? "OK" : g_fpga == -3 ? "ERR PIO/DMA" : "ERR", g_gw_major, g_gw_minor, (unsigned long)g_freq, MODE_NAME[g_mode],
+                g_vol, g_gain_db, (unsigned long)g_iq_rate, (unsigned long)g_rx_sync_err, (unsigned long)g_rx_overrun,
+                g_smeter_db, (unsigned long)g_audio_drop, (unsigned long)g_audio_under,
                 usb_audio_streaming() ? "activ" : "oprit", (unsigned long)usb_audio_drops(),
-                g_sql, g_sql ? (g_sq_open ? "deschis" : "inchis") : "oprit", g_nr, (double)g_sam_offset_hz);
+                g_sql, (double)g_sq_nf, g_sql ? (g_sq_open ? "deschis" : "inchis") : "oprit", g_nr, (double)g_sam_offset_hz);
 }
 
 void loop() {
@@ -710,7 +825,10 @@ void loop() {
     design_bandpass(g_mode);
   }
   if (g_freq_dirty && g_fpga == 1) { g_freq_dirty = false; rb_cmd(0x02, rb_freq()); rb_cmd(0x04, rb_freq()); }
-  if (g_gain_dirty && g_fpga == 1) { g_gain_dirty = false; rb_cmd(0x14, rb_gain_word()); }
+  if (g_gain_dirty && g_fpga == 1) {
+    g_gain_dirty = false; rb_cmd(0x14, rb_gain_word());
+    sq_gain_shift += g_gain_db - g_gain_sent; g_gain_sent = g_gain_db;   // zgomotul urcă/coboară cu câștigul
+  }
 
   uint32_t now = millis();
   if (g_fpga == 1 && now - t_keep >= 100) {          // comenzi retrimise ciclic: reg0, TX, RX1, câștig
@@ -833,7 +951,8 @@ static void settings_load() {
     if (x.mode < MODE_N) g_mode = x.mode;
     if (x.step < 5) step_idx = x.step;
     if (x.vol <= 100) g_vol = x.vol;
-    if (x.sql == 0 || (x.sql >= -130 && x.sql <= -40)) g_sql = x.sql;
+    if (x.sql >= 0 && x.sql <= SQL_MAX) g_sql = x.sql;
+    else if (x.sql < 0) g_sql = 8;                   // setare veche, prag fix în dBFS -> 8 dB peste zgomot
     if (x.nr <= 3) g_nr = x.nr;
     if (x.cal_ppb >= -200000 && x.cal_ppb <= 200000) g_cal_ppb = x.cal_ppb;
     if (x.gain >= -12 && x.gain <= 48) g_gain_db = x.gain;
@@ -1021,11 +1140,7 @@ void loop1() {
       case UI_BAND: band_step(d > 0 ? 1 : -1); break;
       case UI_VOL:  g_vol = constrain(g_vol + 2 * (int)d, 0, 100); break;
       case UI_GAIN: g_gain_db = constrain(g_gain_db + (int)d, -12, 48); g_gain_dirty = true; break;
-      case UI_SQL: {                                 // oprit, apoi -130 ... -40 dBFS în pași de 2 dB
-        int v = g_sql ? g_sql : -132;
-        v = constrain(v + 2 * (int)d, -132, -40);
-        g_sql = (v < -130) ? 0 : v; break;
-      }
+      case UI_SQL: g_sql = constrain(g_sql + (int)d, 0, SQL_MAX); break;   // oprit, apoi 1..40 dB peste zgomot
       case UI_NR: g_nr = constrain(g_nr + (int)d, 0, 3); break;
       case UI_CAL: g_cal_ppb = constrain(g_cal_ppb + 100 * (int)d, -200000, 200000); g_freq_dirty = true; break;   // 0,1 ppm
     }
@@ -1100,7 +1215,7 @@ void loop1() {
     return;
   }
   if (ui_sel == UI_SQL || ui_sel == UI_NR) {
-    if (g_sql) snprintf(l, sizeof(l), "SQL %d", g_sql); else snprintf(l, sizeof(l), "SQL off");
+    if (g_sql) snprintf(l, sizeof(l), "SQL +%d", g_sql); else snprintf(l, sizeof(l), "SQL off");
     x = draw_item(1, 63, l, ui_sel == UI_SQL);
     if (g_nr) snprintf(l, sizeof(l), "NR %d", g_nr); else snprintf(l, sizeof(l), "NR off");
     draw_item(x + 6, 63, l, ui_sel == UI_NR);

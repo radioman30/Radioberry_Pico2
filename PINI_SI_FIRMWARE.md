@@ -1,6 +1,7 @@
 # Radioberry RX pe RP2350-PiZero — pini și firmware (stare la 2 oct 2026)
 
-Firmware: `rx_audio`, commit **e40b5ea**, gateware FPGA **73.3** inclus în UF2.
+Firmware: `rx_audio` cu **gateware PIO 75.2** (RagchewBerry/WP3DN, citit cu PIO + DMA, 4 linii de date) — 3 oct 2026.
+Versiunea veche, pe 8 linii (gateware 73.3): `release/rx_audio_2026-10-03_5730f61.uf2`. Detalii: `PROTOCOL.md` §7.
 Fișierul gata de scris pe placă: `release/rx_audio_2026-10-02_e40b5ea.uf2` (local, nu e pe GitHub —
 conține gateware-ul PA3GSB/Hermes-Lite2, binar terț).
 
@@ -39,10 +40,10 @@ GP = numărul GPIO al RP2350 (pe PiZero NU e mereu egal cu BCM).
 | 8 | 14 | **4** | I2S BCK | PCM5102A **BCK** |
 | 10 | 15 | **5** | I2S LRCK | PCM5102A **LCK** |
 | 11 | 17 | 17 | ieșire FPGA (`pi_cwl`) | **NU LEGA** |
-| 12 | 18 | 18 | Radioberry: date RX bit 4 | — |
+| 12 | 18 | 18 | Radioberry: date RX D0 (PIO) | — |
 | 13 | 27 | 27 | Radioberry: nCONFIG | — |
 | 15 | 22 | 22 | Radioberry: CONF_DONE | — |
-| 16 | 23 | 23 | Radioberry: date RX bit 7 | — |
+| 16 | 23 | 23 | liber (fost date RX bit 7, protocol clasic) | — (intrare; neconfirmat că FPGA nu-l comandă) |
 | 17 | 3V3 | — | alimentare | ⚠️ chiar lângă pinul 18 — atenție la lipituri |
 | **18** | 24 | **24** | Radioberry: DCLK (doar la pornire) | **rețeaua de butoane** prin 470 Ω (§3) |
 | 19 | 10 | 11 | Radioberry: SPI MOSI | — |
@@ -53,15 +54,15 @@ GP = numărul GPIO al RP2350 (pe PiZero NU e mereu egal cu BCM).
 | 26 | 7 | 7 | Radioberry: SPI CE1 | — |
 | 27 | 0 | **0** | encoder | encoder **A** (CLK) |
 | 28 | 1 | **1** | encoder | encoder **B** (DT) |
-| 29 | 5 | 15 | Radioberry: date RX bit 0 | — |
+| 29 | 5 | 15 | Radioberry: TX_DATA (rezervat) | — |
 | 31 | 6 | 6 | Radioberry: ceas RX | — |
-| 32 | 12 | 9 | Radioberry: date RX bit 1 | — |
-| 33 | 13 | 13 | Radioberry: DATA0 / date RX bit 2 | — |
-| 35 | 19 | 19 | Radioberry: date RX bit 5 | — |
-| 36 | 16 | 16 | Radioberry: date RX bit 3 | — |
+| 32 | 12 | 9 | Radioberry: TX_RDY (rezervat) | — |
+| 33 | 13 | 13 | Radioberry: DATA0 (doar la pornire) | — |
+| 35 | 19 | 19 | Radioberry: date RX D1 (PIO) | — |
+| 36 | 16 | 16 | liber (fost date RX bit 3, protocol clasic) | — (intrare; neconfirmat că FPGA nu-l comandă) |
 | 37 | 26 | 26 | Radioberry: nSTATUS | — |
-| 38 | 20 | 20 | Radioberry: date RX bit 6 | — |
-| 40 | 21 | 21 | ieșire FPGA (`pi_cwr`) | **NU LEGA** |
+| 38 | 20 | 20 | Radioberry: date RX D2 (PIO) | — |
+| 40 | 21 | 21 | Radioberry: date RX D3 (PIO) | — |
 
 **PCM5102A:** SCK → GND, XSMT → 3V3, FLT/DEMP/FMT → GND. Căștile în mufa modulului.
 **Encoder:** comunul la GND. Pinul „+” al modulului **nelegat** (are pull-up-uri de 10 kΩ care încurcă butoanele).
@@ -110,13 +111,16 @@ condensator prin rezistența fiecăruia.
 | 2 oct | scos pull-up-ul de 10 kΩ de pe modulele de butoane | reîncărca condensatorul, toate butoanele păreau „encoder” |
 | 2 oct | butonul **BOOT nu mai are funcție** (doar pentru flash) | la cererea ta |
 | 2 oct | USB: PID **2E8A:10F1**, portul devine **COM12** (era COM10) | PID-ul vechi (000F) era același cu modul BOOT → Windows încurca driverele |
+| 3 oct | **gateware PIO 75.2**: date RX doar pe pinii 12/35/38/40 (GP18–21); pinii 16 și 36 (GP23/GP16) nu mai sunt date | gateware-ul RagchewBerry (WP3DN); cablajul tău rămâne neschimbat |
 
 ---
 
 ## 5. Ce face firmware-ul
 
 - **Recepție:** USB, LSB, CW, AM, **FM** (bandă îngustă), **SAM** (AM sincron), 10 kHz – 30 MHz, IQ 48 kHz de la FPGA.
-- **Squelch** (meniu SQL, oprit sau -130…-40 dBFS): taie căștile până apare semnal; USB-ul rămâne neatins.
+- **Squelch** (meniu SQL, oprit sau **+1…+40 dB peste zgomot**): taie căștile până apare semnal; USB-ul rămâne neatins.
+  Zgomotul se estimează singur, deci pragul nu mai trebuie refăcut când schimbi câștigul sau banda (de la 3 oct).
+  Bun de pornit: +6…+10 dB. Starea (`s`) arată și zgomotul estimat.
   Pe ecran „Q” jos-dreapta, inversat când e închis.
 - **Reducere de zgomot** (meniu NR, oprit / 1 / 2 / 3), pe ecran „N”. Simulat: +9 dB (NR1) … +14,5 dB (NR3) SNR.
 - **SAM:** PLL pe purtătoare (prinde ±300 Hz în ~20 ms); la fading distorsiunea scade de la -12 dB la -32 dB (simulat).
@@ -131,7 +135,7 @@ condensator prin rezistența fiecăruia.
   - **IQ brut** — `python tools/iq_record.py -t 60 -o iq_rec` → WAV pentru HDSDR / SDR# / SDR++.
 
 **Comenzi pe COM12:** `s` stare · `f<Hz>` frecvență · `m<0-5>` mod (5 = SAM) · `v<0-100>` volum · `g<-12..48>` câștig ·
-`w<Hz>` filtru · `l<dBFS>` squelch (`l0` oprit) · `n<0-3>` NR · `c` / `c<ppb>` calibrare · `k` / `kd` butoane · `x` inversează IQ (doar pentru teste; implicit corect = neinversat, verificat cu FT8) · `q1`/`q0` flux IQ · `z<start,stop,pas kHz>` baleiaj.
+`w<Hz>` filtru · `l<dB>` squelch peste zgomot, 1–40 (`l0` oprit) · `n<0-3>` NR · `c` / `c<ppb>` calibrare · `k` / `kd` butoane · `x` inversează IQ (doar pentru teste; implicit corect = neinversat, verificat cu FT8) · `q1`/`q0` flux IQ · `z<start,stop,pas kHz>` baleiaj.
 
 ---
 

@@ -142,3 +142,40 @@ Deci: la fiecare RDY=1 host-ul generează 7 fronturi de ceas și citește 7 × 4
   contoarele up/down). Driverul Pi 4 citește 63 de eșantioane per RDY.
 - **Pini RP2350-PiZero:** BCM 23,20,19,18,16,13,12,5 → GP 23,20,19,18,16,13,9,15; RDY GP25; CLK GP6.
   ⚠️ BCM16 și BCM23 sunt linii de date FPGA → conflict cu pinii I2S aleși înainte pe PiZero (GP16/GP23).
+
+## 7. MERGE ȘI PE PIO (3 oct 2026): gateware-ul RagchewBerry (WP3DN), 4 linii + meta
+
+**Validat pe RP2350-PiZero + Radioberry CL025 cu `firmware/rb_bringup_pio`.** Gateware-ul vine din
+[github.com/wp3dn/RagchewBerry](https://github.com/wp3dn/RagchewBerry)
+`components/gateware/bitstreams/CL025/radioberry.rbf` (372 326 o, sha256 `932e10ef…`), copiat local ca
+`gateware/ragchewberry_pio_CL025.rbf`. Header: `python tools/make_gateware_header.py
+gateware/ragchewberry_pio_CL025.rbf rb_bringup_pio "<origine>"`. Repo-ul n-are licență — doar uz personal.
+
+- **Identificare (SPI, cadru cu zero):** `00 00 00 5A 4B 02` → **versiune 75.2**, `[3] = 0x5A` = FPGA tip 2
+  (biți 1:0), **6 receptoare** (biți 5:2), **1 emițător** (biți 7:6). Secvența lui Juan: încărcare →
+  500 ms → citește versiunea până e aceeași de 3 ori (≠ 0, ≠ FF) → reg 0 = `0x00000004` (DUPLEX) →
+  frecvențe TX (C0 0x02) și RX1 (C0 0x04). SPI1 mod 3 la **10 MHz** merge.
+- **RX:** exact programul PIO din §3 (identic cu `rb-rx.pio` al lui Juan), date GP18–21, RDY GP25, CLK GP6,
+  autopush 28 biți, **divizor 2**. Măsurat: **48 128 perechi IQ/s, 0 erori de sync**, meta 0 = I, 1 = Q,
+  I și Q din cuvinte consecutive (0 apoi 1) formează perechea. Încărcarea durează ~620 ms.
+- **Câștig LNA:** aceeași comandă ca la HL2 (C0 `0x14`, `0x40 | (dB + 12)`) și aproape aceeași curbă,
+  măsurată cu antena: −12 dB → −102 dBFS; 0 → −92; +30 → −63,5; +44 → −51; +48 → −43.
+  ⚠️ Diferență: **fără comandă, gateware-ul pornește cu câștig MARE** (~−47 dBFS), nu la −12 dB ca HL2.
+- ⚠️ **Orientarea e INVERSĂ față de §6:** purtătoarea AM de pe 9640 kHz apare la −3193 Hz cu acord pe
+  9637 kHz și la +2807 / +4806 Hz cu acord pe 9643 / 9645 kHz. Deci la acest gateware **I + jQ = frecvențe
+  negative**; pentru convenția din rx_audio (frecvențe pozitive = USB) trebuie **negat Q** (sau I↔Q).
+  Echilibru I/Q 0,05 dB, corelație I/Q < 0,01 → perechile sunt corecte; imaginea e sub zgomot.
+- **Pini eliberați față de §6:** se folosesc doar GP18–21 pentru date; **BCM16 / BCM23 (GP16 / GP23) nu mai
+  sunt linii FPGA** → conflictul cu I2S dispare. Rămâne de verificat ce ține gateware-ul pe acele linii
+  (trebuie lăsate intrări până se confirmă că FPGA-ul nu le comandă).
+- **TX** (pentru mai târziu): la Juan, `rb-tx.pio` + `stream_tx_dma.c`, MOX prin C0 0x01 cu păstrarea bitului
+  DUPLEX, drive prin C0 `0x12` (`drive << 28`, el folosește 4/15).
+- ⚠️ **În `rx_audio` (stiva Adafruit TinyUSB + I2S + microfon USB) NU se pune handler pe `DMA_IRQ_1`:**
+  `irq_add_shared_handler(DMA_IRQ_1, …)` oprea firmware-ul (în `rb_bringup_pio`, cu stiva USB standard, mergea).
+  Atenție la simptom: în arduino-pico un `panic()` repornește placa direct în **BOOT** (`PICO_ENTER_USB_BOOT_ON_EXIT`),
+  deci „placa a intrat singură în BOOT" = firmware-ul a crăpat. Soluția din rx_audio: **un singur canal DMA fără
+  întreruperi**, `dma_encode_endless_transfer_count()` + `channel_config_set_ring(write, 15)` într-un inel de 32 KB
+  aliniat la 32 KB (8192 cuvinte = 85 ms); bucla principală citește `write_addr` al canalului și procesează ce s-a
+  adunat. Verificat 3 oct: 2 minute cu 8 schimbări de setări (scrieri în flash cu DMA-ul activ), 48 000 perechi/s,
+  0 erori de sync, 0 depășiri; orientarea după negarea lui Q confirmată (aceeași stație la 9660,000 kHz din acord
+  pe 9637 și pe 9643 kHz).
