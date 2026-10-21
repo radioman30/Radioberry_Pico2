@@ -108,6 +108,7 @@ static volatile int      g_fpga = 0;                // 1 = OK
 static volatile uint8_t  g_gw_major = 0, g_gw_minor = 0;
 static volatile float    g_smeter_db = -140;
 static volatile uint32_t g_iq_rate = 0, g_audio_drop = 0, g_audio_under = 0;
+static volatile uint32_t g_oled_test_until = 0;  // comanda o: model de test pe OLED până la acest moment
 static volatile bool     g_ui_ready = false;        // nucleul 1 poate lua pinul DCLK ca buton
 // WM8960: 0 = încă nu s-a încercat, 1 = pornit (codec master, PIO duplex), -1 = lipsă -> PCM5102A
 static volatile int      g_wm = 0;
@@ -929,6 +930,7 @@ static void freed_pin_test() {
 
 static void handle_cmd(const char *s) {
   if (s[0] == 'i') { pin_activity(); return; }
+  if (s[0] == 'o') { g_oled_test_until = millis() + 15000; Serial.println("OLED: model de test 15 s"); return; }
   if (s[0] == 'u') { if (g_wm == 1) Serial.println("u: GP16/GP23 sunt ale WM8960 acum"); else freed_pin_test(); return; }
   if (s[0] == 'a') {                                  // WM8960: a | ah<reg> | as<reg> | am<pga> | ab<boost> | al1/al0
     long a = atol(s + 2);
@@ -1506,6 +1508,17 @@ void loop1() {
 
   if (millis() - t_draw < 80) return;
   t_draw = millis();
+  if ((int32_t)(g_oled_test_until - millis()) > 0) {  // model de test: chenar + linii la rândurile 0/2/4 și 59/61/63
+    oled.clearBuffer();
+    oled.drawFrame(0, 0, 128, 64);
+    for (int y : { 2, 4, 59, 61 }) oled.drawHLine(20, y, 88);
+    oled.setFont(u8g2_font_5x7_tf);
+    oled.drawStr(4, 8, "0"); oled.drawStr(112, 8, "2/4");
+    oled.drawStr(30, 36, "TEST OLED 128x64");
+    oled.drawStr(4, 62, "63"); oled.drawStr(104, 58, "59/61");
+    oled.sendBuffer();
+    return;
+  }
   char l[24];
   uint32_t f = g_freq;
   oled.clearBuffer();
