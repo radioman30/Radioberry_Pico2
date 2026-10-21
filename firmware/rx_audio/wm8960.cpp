@@ -58,8 +58,12 @@ static bool wr(TwoWire &w, uint8_t reg, uint16_t v) {
 
 static uint16_t power2() { return P2_DACL | P2_DACR | P2_LOUT1 | P2_ROUT1 | P2_PLL | (spk_on ? (P2_SPKL | P2_SPKR) : 0); }
 
+// Detectare prin scrierea registrului de reset (oricum urmează init-ul), NU prin transmisie fără date:
+// Wire face „probe"-ul acela bit-bang (pinii trec pe SIO și înapoi), iar pe magistrala cu OLED + HAT lăsa
+// cipurile în mijlocul unei confirmări, cu SDA ținut jos (22 oct).
 bool wm8960_probe(TwoWire &w) {
   w.beginTransmission(WM8960_ADDR);
+  w.write((uint8_t)(0x0F << 1)); w.write((uint8_t)0);
   return w.endTransmission() == 0;
 }
 

@@ -15,6 +15,8 @@
 //     după ultima schimbare și se reîncarcă la pornire.
 // CAT: emulare Kenwood TS-2000 pe același port (comenzi cu „;”): WSJT-X, fldigi, Omni-Rig/HDSDR.
 // USB (115200): s stare | f<Hz> frecvența | m<0-5> modul (USB LSB CW AM FM SAM) | l<dB> squelch: prag în dB peste zgomotul estimat, 1..40 (l0 = oprit) | n<0-3> reducere zgomot | c calibrare automată (în SAM, pe o stație AM) | c<ppb> calibrare manuală | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
+//   TX: t stare | t1/t0 PTT | tt TUNE (ton +1 kHz) | td<0-15> drive | tg<dB> microfon | to<s> timp maxim | tq orientare Q
+//   PTT și pe BOOT (ținut), butonul de 4,7 kΩ de pe rețeaua RC și CAT (TX;/RX;)
 //   WM8960: a stare | ah<0x30-0x7F> căști (121 = 0 dB, 0 = mut) | as<reg> difuzor (0 = oprit) | am<0-63> PGA microfon | ab<0-3> boost | al1/al0 microfonul în căști (test) | au1/au2/au0 microfonul L/R pe USB în locul radioului (test)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
@@ -98,7 +100,7 @@ static volatile bool     g_keys_rc = false;         // rețeaua RC e montată (d
 static volatile uint32_t g_keys_detect_us = 0, g_key_us = 0;
 static volatile int      g_key_last = K_NONE;
 static volatile bool     g_keys_pause = false;
-static const char *KEY_NAME[] = { "-", "ENCODER", "MOD", "BANDA", "FILTRU", "PAS" };      // diagnosticul „kd" ține nucleul 1 departe de pin
+static const char *KEY_NAME[] = { "-", "ENCODER", "MOD", "BANDA", "PTT", "PAS" };   // 4,7 kΩ: fost FILTRU, acum PTT (ținut)      // diagnosticul „kd" ține nucleul 1 departe de pin
 static volatile int      g_vol = 30;                // 0..100
 static volatile int      g_gain_db = 20;            // câștig LNA AD9866: -12..+48 dB
 static volatile bool     g_gain_dirty = false;
@@ -118,7 +120,28 @@ static volatile int      g_mic_usb = 0;             // test: 0 = USB primește r
 static volatile int      g_wm_retry = 0;            // ar: 1 = cerut, 2 = nucleul 1 a terminat init-ul (rezultat în g_wm_init)
 static volatile int      g_wm_init = 0;
 static volatile bool     g_i2c_scan = false;        // ai: scanare I2C pe nucleul 1
-static volatile int      g_i2c_recover_pulses = -1; // impulsuri SCL date la pornire ca să deblocheze SDA (-1 = n-a fost nevoie)
+// 100 kHz, nu 400: cu OLED + WM8960 HAT pe fire (două seturi de pull-up), la 400 kHz transmisiile cădeau
+// la întâmplare (timeout la registre WM8960, SDA blocat) — 22 oct.
+#define I2C_HZ 100000
+static volatile uint32_t g_i2c_fixes = 0;
+static volatile uint32_t g_core1_beat = 0;         // crește la fiecare trecere prin loop1 (nucleul 1 trăiește?)
+static volatile bool     g_wm_stop_req = false;    // aX: resetează codecul (oprește BCLK/LRCLK) — test de diafonie
+static volatile bool     g_boot_ptt = false;        // BOOT ca PTT: oprit implicit (citirea îngheață scurt nucleul 0)          // deblocări I2C în funcționare
+static volatile int      g_i2c_recover_pulses = -1;
+// TX (detalii în secțiunea EMISIE)
+enum { TXS_MIC_SSB, TXS_MIC_AM, TXS_TONE };
+static volatile bool     g_tx_on = false;           // emite: MOX pus pe toate comenzile SPI
+static volatile int      g_tx_src = 2;              // TXS_*
+static volatile bool     g_ptt_boot = false, g_ptt_key = false, g_ptt_cat = false, g_ptt_usb = false, g_tune_req = false;
+static volatile bool     g_tx_lock = false;         // refuz / timp maxim: se așteaptă eliberarea tuturor PTT-urilor
+static volatile int      g_tx_drive = 4;            // 0..15 (RagchewBerry pornește cu 4)
+static volatile bool     g_tx_drive_dirty = false;
+static volatile int      g_tx_timeout_s = 30;       // timp maxim de emisie (teste)
+static volatile int      g_tx_mic_db = 0;           // câștig digital al microfonului la emisie
+static volatile bool     g_tx_qneg = true;          // Radioberry: spectrul TX inversat (ca la RagchewBerry)
+static void tx_mic48(int16_t s);
+static void tx_rx_probe(float i, float q);
+static bool tx_band_ok(uint32_t f); // impulsuri SCL date la pornire ca să deblocheze SDA (-1 = n-a fost nevoie)
 
 // ============================================================
 // FPGA: încărcare passive serial (LSB primul)
@@ -159,6 +182,7 @@ static const uint32_t RB_REG0 = 0x00000004;         // 48 kHz, 1 RX, DUPLEX=1 (a
 // pornire și se retrimite ciclic, ca valoarea aleasă să fie mereu cea efectivă.
 static inline uint32_t rb_gain_word() { return 0x40u | (uint32_t)(g_gain_db + 12); }
 static void rb_cmd(uint8_t c0, uint32_t data) {
+  if (g_tx_on) c0 |= 1;                              // MOX: bitul 0 pe fiecare comandă cât timp emite
   uint8_t tx[6] = { 0x05, c0, (uint8_t)(data >> 24), (uint8_t)(data >> 16), (uint8_t)(data >> 8), (uint8_t)data }, rx[6];
   gpio_put(PIN_SPI_CE0, 0);
   spi_write_read_blocking(spi1, tx, rx, 6);
@@ -454,7 +478,7 @@ static float up_prev = 0;
 static uint32_t wm_tx[WM_RING_WORDS] __attribute__((aligned(1u << WM_RING_BITS)));
 static uint32_t wm_rx[WM_RING_WORDS] __attribute__((aligned(1u << WM_RING_BITS)));
 static uint16_t wm_prog_instr[10];
-static PIO  wm_pio; static uint wm_sm; static int wm_dma_tx = -1, wm_dma_rx = -1;
+static PIO  wm_pio; static uint wm_sm; static int wm_dma_tx = -1, wm_dma_rx = -1, wm_off = -1;
 static uint32_t wm_tx_w = 0, wm_rx_rd = 0;           // indici în inele (următorul de scris / de citit)
 static uint32_t wm_last = 0;                          // ultimul cadru scris (se repetă la goliciune)
 static volatile uint32_t g_wm_frames = 0, g_wm_rate = 0;
@@ -478,7 +502,7 @@ static bool wm_pio_start() {
   for (PIO pp : pios) {
     if (!pio_can_add_program(pp, &prog)) continue;
     if ((sm = pio_claim_unused_sm(pp, false)) < 0) continue;
-    wm_pio = pp; off = pio_add_program(pp, &prog); break;
+    wm_pio = pp; off = wm_off = pio_add_program(pp, &prog); break;
   }
   if (off < 0) return false;
   wm_sm = (uint)sm;
@@ -534,7 +558,8 @@ static void audio_out_begin() {
 }
 static void aq_put(int16_t v) { aq[aq_w] = v; aq_w = (aq_w + 1) % AQ; }
 static void audio_out_push(float x) {
-  if (g_mic_loop) return;                             // testul cu microfonul ține coada
+  if (g_mic_loop && !g_tx_on) return;                // testul cu microfonul ține coada
+  if (g_tx_on) x = 0;                                 // la emisie difuzorul tace (altfel microfonie)
   if (x > 1) x = 1; if (x < -1) x = -1;
   int n = (aq_w - aq_r + AQ) % AQ;
   if (n >= AQ - UPS) { g_audio_drop++; up_prev = x; return; }   // ceasul FPGA > ceasul audio: aruncă
@@ -549,7 +574,8 @@ static void audio_in_poll() {
     uint32_t f = wm_rx[wm_rx_rd]; wm_rx_rd = (wm_rx_rd + 1) % WM_RING_WORDS; n++;
     int16_t l = (int16_t)(f >> 16), r = (int16_t)f;
     if (abs(l) > pl) pl = abs(l); if (abs(r) > pr) pr = abs(r);
-    if (g_mic_loop && (aq_w - aq_r + AQ) % AQ < AQ - 1) aq_put((int16_t)(((int32_t)l + r) / 2));
+    if (g_tx_on) { if (g_tx_src != TXS_TONE) tx_mic48((int16_t)(((int32_t)l + r) / 2)); }
+    else if (g_mic_loop && (aq_w - aq_r + AQ) % AQ < AQ - 1) aq_put((int16_t)(((int32_t)l + r) / 2));
     if (g_mic_usb) usb_audio_push48k(g_mic_usb == 1 ? l : r);
   }
   g_mic_pk_l = pl; g_mic_pk_r = pr; g_wm_frames += n;
@@ -580,6 +606,30 @@ static void audio_out_pump() {
     else g_audio_under++;                              // goliciune: se repetă ultimul cadru
     wm_tx[wm_tx_w] = wm_last; wm_tx_w = (wm_tx_w + 1) % WM_RING_WORDS; ahead++;
   }
+}
+
+// WM8960 apărut după pornire (HAT alimentat odată cu placa pornește mai încet, magistrală deblocată etc.):
+// la 3 s se cere nucleului 1 o încercare; dacă reușește, sunetul trece de pe PCM5102A pe codec, fără restart.
+static void wm_hot_poll() {
+  static uint32_t t_try = 0;
+  if (g_wm == -1 && g_wm_retry == 0 && millis() - t_try > 3000) { t_try = millis(); g_wm_retry = 1; }
+  if (g_wm_retry != 2) return;
+  if (g_wm_init == 1 && g_wm == -1) {
+    i2s.end();                                        // PCM5102A eliberează GP4/GP5 (devin intrări de ceas)
+    g_wm = wm_pio_start() ? 1 : -2;                   // ia și GP16/GP23 (pio_gpio_init)
+  }
+  g_wm_retry = 0;
+}
+
+// după o reinițializare a codecului ceasurile se opresc și repornesc: programul PIO se ia de la capăt
+// (instrucțiunile 0-2 așteaptă începutul canalului stâng), altfel stânga/dreapta pot rămâne decalate
+static void wm_pio_resync() {
+  if (wm_off < 0) return;
+  pio_sm_set_enabled(wm_pio, wm_sm, false);
+  pio_sm_restart(wm_pio, wm_sm);
+  pio_sm_exec(wm_pio, wm_sm, pio_encode_set(pio_x, 0));
+  pio_sm_exec(wm_pio, wm_sm, pio_encode_jmp(wm_off));
+  pio_sm_set_enabled(wm_pio, wm_sm, true);
 }
 
 static void wm_status() {
@@ -714,6 +764,7 @@ static void rx_pair(int32_t i, int32_t q) {
   if (RB_Q_NEG != g_iq_inv) q = -q;                  // convenția firmware-ului: +f = USB
   float out;
   float fi = i / 8388608.0f, fq = q / 8388608.0f;
+  if (g_tx_on) tx_rx_probe(fi, fq);
   if (dsp_push(fi, fq, &out)) { audio_out_push(out); if (!g_mic_usb) usb_audio_push12k(g_dsp_raw); }
   if (cap_req) {
     cap_i[cap_n] = fi; cap_q[cap_n] = fq;
@@ -741,6 +792,284 @@ static void rx_poll() {
     else if (meta == 1 && synced) { rx_pair(cur_i, s); synced = false; }
     else { g_rx_sync_err++; synced = false; }        // Q fără I înainte, sau meta necunoscut
   }
+}
+
+// ============================================================
+// EMISIE (TX)
+// Calea spre FPGA (din RagchewBerry/WP3DN: rb-tx.pio, main.c): FPGA-ul ridică TX_RDY (GP9) când vrea un
+// eșantion; PIO-ul trimite atunci un cuvânt de 32 de biți, bit cu bit (MSB primul), date pe GP15, ceas pe GP14:
+// I în biții 31:16, Q în 15:0, 48 kHz. MOX = bitul 0 din C0, pus pe TOATE comenzile SPI cât timp emite;
+// drive = C0 0x12, nivel 0..15 în biții 31:28. Spectrul TX e inversat ca la RX: pentru USB se neagă Q.
+// Surse: microfonul WM8960 (USB/LSB: filtru complex 300-2700 Hz la 12 kHz; AM), ton (TUNE, CW).
+// Siguranță: doar în benzile de radioamator, timp maxim de emisie, oprire la eliberarea PTT-ului;
+// după un refuz sau un timp maxim, PTT-ul trebuie eliberat complet înainte de o nouă emisie.
+// PTT: BOOT ținut apăsat, butonul PTT de pe rețeaua RC (4,7 kΩ, fost FILTRU), CAT (TX;/RX;), USB (t1, tt).
+// ============================================================
+#define PIN_TX_CLK  14                               // BCM4,  pin 7
+#define PIN_TX_DATA 15                               // BCM5,  pin 29
+#define PIN_TX_RDY   9                               // BCM12, pin 32
+static const char *TXS_NAME[] = { "MIC SSB", "MIC AM", "TON" };
+static uint32_t g_tx_t0 = 0;
+static float    g_tx_tone_hz = 1000;                 // TUNE: ton la +1 kHz (USB) / -1 kHz (LSB) față de acord
+static float    g_tx_level = 0.5f;                   // amplitudinea tonului (0..0,95)
+static volatile uint32_t g_tx_under = 0, g_tx_over = 0, g_tx_rate = 0;
+static volatile float g_tx_mic_pk = 0;
+static volatile float g_tx_probe_pos = -200, g_tx_probe_neg = -200;   // RX în timpul TX: puterea la +ton / -ton
+
+// ---------- PIO + DMA (inel fără IRQ, ca la RX) ----------
+static uint16_t tx_prog_instr[9];
+static PIO  tx_pio; static uint tx_sm; static int tx_off = -1, tx_dma = -1;
+static pio_sm_config tx_cfg;
+#define TX_RING_BITS  15                             // 32 KB = 8192 eșantioane = 170 ms
+#define TX_RING_WORDS (1u << (TX_RING_BITS - 2))
+static uint32_t tx_ring[TX_RING_WORDS] __attribute__((aligned(1u << TX_RING_BITS)));
+static uint32_t tx_w = 0;
+static const uint32_t TX_LEAD_MIN = 1024, TX_LEAD = 2048, TX_LEAD_MAX = 6000;
+
+static uint32_t tx_rd() { return ((uint32_t)dma_hw->ch[tx_dma].read_addr - (uint32_t)tx_ring) / 4 % TX_RING_WORDS; }
+
+static bool tx_hw_init() {
+  // programul lui PA3GSB/WP3DN (rb-tx.pio), construit la rulare. side-set 1 bit + opt = ceasul (GP14)
+  uint16_t *p = tx_prog_instr;
+  p[0] = pio_encode_jmp_pin(2)   | pio_encode_sideset_opt(1, 1) | pio_encode_delay(2);   // idle: RDY=1 -> start
+  p[1] = pio_encode_jmp(0)       | pio_encode_sideset_opt(1, 0) | pio_encode_delay(2);
+  p[2] = pio_encode_nop()        | pio_encode_sideset_opt(1, 0) | pio_encode_delay(2);   // start: ceas jos
+  p[3] = pio_encode_set(pio_x, 31);
+  p[4] = pio_encode_pull(false, true);                                                    // pull block
+  p[5] = pio_encode_out(pio_pins, 1);                                                     // bitloop
+  p[6] = pio_encode_nop()        | pio_encode_sideset_opt(1, 1) | pio_encode_delay(2);   // ceas sus: FPGA citește
+  p[7] = pio_encode_jmp_x_dec(5) | pio_encode_sideset_opt(1, 0) | pio_encode_delay(2);
+  p[8] = pio_encode_jmp(0);
+  static const struct pio_program prog = { .instructions = tx_prog_instr, .length = 9, .origin = -1 };
+  PIO pios[] = { pio0, pio1, pio2 };
+  int sm = -1;
+  for (PIO pp : pios) {
+    if (!pio_can_add_program(pp, &prog)) continue;
+    if ((sm = pio_claim_unused_sm(pp, false)) < 0) continue;
+    tx_pio = pp; tx_off = pio_add_program(pp, &prog); break;
+  }
+  if (tx_off < 0) return false;
+  tx_sm = (uint)sm;
+  tx_cfg = pio_get_default_sm_config();
+  sm_config_set_wrap(&tx_cfg, tx_off, tx_off + 8);
+  sm_config_set_sideset(&tx_cfg, 2, true, false);
+  sm_config_set_sideset_pins(&tx_cfg, PIN_TX_CLK);
+  sm_config_set_out_pins(&tx_cfg, PIN_TX_DATA, 1);
+  sm_config_set_out_shift(&tx_cfg, false, false, 32);
+  sm_config_set_jmp_pin(&tx_cfg, PIN_TX_RDY);
+  sm_config_set_clkdiv(&tx_cfg, 12.0f);              // ca la RagchewBerry: ~65 000 cuvinte/s maxim > 48 000
+  gpio_init(PIN_TX_CLK);  gpio_set_dir(PIN_TX_CLK, GPIO_OUT);  gpio_put(PIN_TX_CLK, 0);
+  gpio_init(PIN_TX_DATA); gpio_set_dir(PIN_TX_DATA, GPIO_OUT); gpio_put(PIN_TX_DATA, 0);
+  gpio_init(PIN_TX_RDY);  gpio_set_dir(PIN_TX_RDY, GPIO_IN);   gpio_pull_up(PIN_TX_RDY);
+  if ((tx_dma = dma_claim_unused_channel(false)) < 0) return false;
+  return true;
+}
+
+static void tx_hw_start() {
+  memset(tx_ring, 0, sizeof tx_ring);
+  tx_w = TX_LEAD;
+  pio_sm_set_enabled(tx_pio, tx_sm, false);
+  pio_sm_set_pins_with_mask(tx_pio, tx_sm, 0, (1u << PIN_TX_CLK) | (1u << PIN_TX_DATA));
+  pio_gpio_init(tx_pio, PIN_TX_CLK); pio_gpio_init(tx_pio, PIN_TX_DATA);
+  pio_sm_set_consecutive_pindirs(tx_pio, tx_sm, PIN_TX_CLK, 2, true);   // GP14, GP15
+  pio_sm_init(tx_pio, tx_sm, tx_off, &tx_cfg);
+  pio_sm_clear_fifos(tx_pio, tx_sm);
+  dma_channel_config c = dma_channel_get_default_config(tx_dma);
+  channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+  channel_config_set_read_increment(&c, true);
+  channel_config_set_write_increment(&c, false);
+  channel_config_set_ring(&c, false, TX_RING_BITS);
+  channel_config_set_dreq(&c, pio_get_dreq(tx_pio, tx_sm, true));
+  dma_channel_configure(tx_dma, &c, &tx_pio->txf[tx_sm], tx_ring, dma_encode_endless_transfer_count(), true);
+  pio_sm_set_enabled(tx_pio, tx_sm, true);
+}
+
+static void tx_hw_stop() {
+  dma_channel_abort(tx_dma);
+  pio_sm_set_enabled(tx_pio, tx_sm, false);
+  pio_sm_clear_fifos(tx_pio, tx_sm);
+  pio_sm_set_pins_with_mask(tx_pio, tx_sm, 0, (1u << PIN_TX_CLK) | (1u << PIN_TX_DATA));
+}
+
+// un eșantion IQ în convenția firmware-ului (+f = USB) -> inel
+static void tx_put(float i, float q) {
+  if (g_tx_qneg) q = -q;                            // Radioberry: spectrul TX e inversat
+  if (i > 0.95f) i = 0.95f; if (i < -0.95f) i = -0.95f;
+  if (q > 0.95f) q = 0.95f; if (q < -0.95f) q = -0.95f;
+  uint32_t ahead = (tx_w - tx_rd()) % TX_RING_WORDS;
+  if (ahead > TX_LEAD_MAX) { g_tx_over++; return; } // microfonul (ceasul codecului) e mai rapid: aruncă
+  int16_t si = (int16_t)lrintf(i * 32767.0f), sq = (int16_t)lrintf(q * 32767.0f);
+  tx_ring[tx_w] = ((uint32_t)(uint16_t)si << 16) | (uint16_t)sq;
+  tx_w = (tx_w + 1) % TX_RING_WORDS;
+}
+
+// ---------- DSP microfon: 48 kHz -> /4 -> 12 kHz (procesare) -> ×4 -> 48 kHz IQ ----------
+#define NTXD 41                                      // decimare: trece-jos 3 kHz la 48 kHz
+#define NTXB 127                                     // filtru complex 300-2700 Hz la 12 kHz (o singură bandă laterală)
+#define NTXI 48                                      // interpolare ×4: trece-jos 3 kHz la 48 kHz (12 coeficienți/fază)
+static float h_txd[NTXD], h_txb_r[NTXB], h_txb_i[NTXB], h_txi[NTXI];
+static float txd_buf[2 * NTXD]; static int txd_pos = 0, txd_ph = 0;
+static float txb_buf[2 * NTXB]; static int txb_pos = 0;
+static float txi_i[2 * (NTXI / 4)], txi_q[2 * (NTXI / 4)]; static int txi_pos = 0;
+static float tx_env = 0, tx_dc = 0, tx_dcy = 0;
+
+static void tx_dsp_init() {
+  design_lowpass(h_txd, NTXD, 3000, 48000);
+  float lp[NTXB];
+  design_lowpass(lp, NTXB, 1200, 12000);             // ±1200 Hz în jurul lui 1500 Hz = 300..2700 Hz
+  const float w0 = 2 * (float)M_PI * 1500 / 12000;
+  for (int k = 0; k < NTXB; k++) {                   // ×2: ieșirea analitică păstrează amplitudinea intrării reale
+    float a = w0 * (k - (NTXB - 1) / 2.0f);
+    h_txb_r[k] = 2 * lp[k] * cosf(a); h_txb_i[k] = 2 * lp[k] * sinf(a);
+  }
+  design_lowpass(h_txi, NTXI, 3000, 48000);
+  for (int k = 0; k < NTXI; k++) h_txi[k] *= 4;      // câștigul pierdut la inserarea zerourilor
+}
+static void tx_dsp_reset() {
+  memset(txd_buf, 0, sizeof txd_buf); memset(txb_buf, 0, sizeof txb_buf);
+  memset(txi_i, 0, sizeof txi_i); memset(txi_q, 0, sizeof txi_q);
+  txd_pos = txd_ph = txb_pos = txi_pos = 0; tx_env = 0; tx_dc = tx_dcy = 0;
+}
+// convoluție cu bufferul „cel mai nou primul": buf[pos + k] = x[n - k]
+static inline void ring_push(float *buf, int n, int &pos, float x) { pos = (pos - 1 + n) % n; buf[pos] = buf[pos + n] = x; }
+
+static void tx_emit12(float i, float q) {            // 1 eșantion la 12 kHz -> 4 la 48 kHz
+  const int M = NTXI / 4;
+  ring_push(txi_i, M, txi_pos, i); txi_q[txi_pos] = txi_q[txi_pos + M] = q;
+  for (int ph = 0; ph < 4; ph++) {
+    float yi = 0, yq = 0;
+    for (int m = 0; m < M; m++) { float h = h_txi[ph + 4 * m]; yi += h * txi_i[txi_pos + m]; yq += h * txi_q[txi_pos + m]; }
+    tx_put(yi, yq);
+  }
+}
+
+static void tx_mic48(int16_t s) {
+  float x = s / 32768.0f;
+  ring_push(txd_buf, NTXD, txd_pos, x);
+  if (++txd_ph < 4) return;
+  txd_ph = 0;
+  float a = 0;
+  for (int k = 0; k < NTXD; k++) a += h_txd[k] * txd_buf[txd_pos + k];
+  // 12 kHz: fără DC, câștig, limitator (atac instant, revenire ~0,2 s) -> vârfuri ≤ 0,3
+  tx_dcy = a - tx_dc + 0.995f * tx_dcy; tx_dc = a; a = tx_dcy;
+  a *= powf(10.0f, g_tx_mic_db / 20.0f);
+  float m = fabsf(a);
+  if (m > g_tx_mic_pk) g_tx_mic_pk = m;
+  tx_env = m > tx_env ? m : tx_env * 0.9995f;
+  if (tx_env > 0.3f) a *= 0.3f / tx_env;
+  if (g_tx_src == TXS_MIC_AM) {
+    tx_emit12(0.45f * (1 + 2.8f * a), 0);            // purtătoare 0,45, modulație ~85 % la vârf
+    return;
+  }
+  ring_push(txb_buf, NTXB, txb_pos, a);
+  float yi = 0, yq = 0;
+  for (int k = 0; k < NTXB; k++) { float v = txb_buf[txb_pos + k]; yi += h_txb_r[k] * v; yq += h_txb_i[k] * v; }
+  yi *= 2.8f; yq *= 2.8f;                            // vârf ~0,85
+  if (g_mode == MODE_LSB) yq = -yq;                  // conjugat = banda laterală inferioară
+  tx_emit12(yi, yq);
+}
+
+// RX în timpul TX (duplex): cât din propriul semnal apare la +ton și la -ton. Confirmă că iese RF și
+// că banda laterală e cea corectă (USB: tonul trebuie să fie la +ton).
+static float tx_ph_pos = 0; static float tx_acc_pr = 0, tx_acc_pi = 0, tx_acc_nr = 0, tx_acc_ni = 0; static int tx_acc_n = 0;
+static void tx_rx_probe(float i, float q) {
+  float w = 2 * (float)M_PI * g_tx_tone_hz / 48000.0f;
+  tx_ph_pos += w; if (tx_ph_pos > 2 * (float)M_PI) tx_ph_pos -= 2 * (float)M_PI;
+  float c = cosf(tx_ph_pos), s = sinf(tx_ph_pos);
+  tx_acc_pr += i * c + q * s; tx_acc_pi += q * c - i * s;     // (i+jq)·e^{-jwt}
+  tx_acc_nr += i * c - q * s; tx_acc_ni += q * c + i * s;     // (i+jq)·e^{+jwt}
+  if (++tx_acc_n >= 4800) {
+    float n = (float)tx_acc_n;
+    g_tx_probe_pos = 10 * log10f((tx_acc_pr * tx_acc_pr + tx_acc_pi * tx_acc_pi) / (n * n) + 1e-20f);
+    g_tx_probe_neg = 10 * log10f((tx_acc_nr * tx_acc_nr + tx_acc_ni * tx_acc_ni) / (n * n) + 1e-20f);
+    tx_acc_pr = tx_acc_pi = tx_acc_nr = tx_acc_ni = 0; tx_acc_n = 0;
+  }
+}
+
+static void tx_say(const char *msg) { if (!g_stream && !cat_active()) Serial.printf("TX: %s\n", msg); }
+
+static void tx_start() {
+  const char *why = nullptr;
+  int src = TXS_TONE;
+  if (g_tune_req) src = TXS_TONE;
+  else if (g_mode == MODE_USB || g_mode == MODE_LSB) src = TXS_MIC_SSB;
+  else if (g_mode == MODE_AM || g_mode == MODE_SAM) src = TXS_MIC_AM;
+  else if (g_mode == MODE_CW) src = TXS_TONE;
+  else why = "FM nu e implementat la emisie";
+  if (g_fpga != 1 || tx_dma < 0) why = "FPGA / PIO TX indisponibil";
+  else if (g_wm != 1) why = "fara WM8960 (GP14 e al PCM5102A, nu exista microfon)";
+  else if (!tx_band_ok(g_freq)) why = "frecventa in afara benzilor de radioamator";
+  if (why) { tx_say(why); g_tx_lock = true; return; }
+
+  g_tx_src = src;
+  tx_dsp_reset(); g_tx_under = g_tx_over = 0; g_tx_mic_pk = 0;
+  g_tx_probe_pos = g_tx_probe_neg = -200; tx_acc_n = 0; tx_acc_pr = tx_acc_pi = tx_acc_nr = tx_acc_ni = 0;
+  if (src == TXS_TONE) g_tx_tone_hz = g_mode == MODE_CW ? 700 : 1000;
+  rb_cmd(0x02, rb_freq());                           // frecvența TX = acordul
+  rb_cmd(0x12, (uint32_t)(g_tx_drive & 0x0F) << 28); // drive
+  tx_hw_start();                                     // fluxul pornește cu MOX încă oprit
+  g_tx_on = true; g_tx_t0 = millis();
+  rb_cmd(0x00, RB_REG0);                             // MOX (bitul 0 se adaugă în rb_cmd)
+  char m[96];
+  snprintf(m, sizeof m, "PORNIT %lu Hz %s, sursa %s, drive %d/15, max %d s", (unsigned long)g_freq, MODE_NAME[g_mode],
+           TXS_NAME[src], g_tx_drive, g_tx_timeout_s);
+  tx_say(m);
+}
+
+static void tx_stop(const char *why) {
+  g_tx_on = false;
+  rb_cmd(0x00, RB_REG0);                             // întâi MOX jos (RF oprit), apoi fluxul
+  tx_hw_stop();
+  char m[96];
+  snprintf(m, sizeof m, "OPRIT (%s) dupa %.1f s, sub %lu peste %lu", why, (millis() - g_tx_t0) / 1000.0,
+           (unsigned long)g_tx_under, (unsigned long)g_tx_over);
+  tx_say(m);
+}
+
+// apelat din loop(): PTT, timp maxim, ton, rezerva inelului
+static void tx_poll() {
+  bool req = g_ptt_boot || g_ptt_key || g_ptt_cat || g_ptt_usb || g_tune_req;
+  if (g_tx_lock) { if (!req) g_tx_lock = false; req = false; }
+  if (req && !g_tx_on) tx_start();
+  else if (!req && g_tx_on) tx_stop("PTT eliberat");
+  if (!g_tx_on) return;
+  if (millis() - g_tx_t0 > (uint32_t)g_tx_timeout_s * 1000) {
+    g_ptt_cat = g_ptt_usb = g_tune_req = false; g_tx_lock = true;
+    tx_stop("TIMP MAXIM");
+    return;
+  }
+  if (g_tx_drive_dirty) { g_tx_drive_dirty = false; rb_cmd(0x12, (uint32_t)(g_tx_drive & 0x0F) << 28); }
+  uint32_t rd = tx_rd();
+  static uint32_t last_rd = 0, cnt = 0, t_rate = 0;
+  cnt += (rd - last_rd) % TX_RING_WORDS; last_rd = rd;
+  if (millis() - t_rate >= 1000) { t_rate = millis(); g_tx_rate = cnt; cnt = 0; }
+  uint32_t ahead = (tx_w - rd) % TX_RING_WORDS;
+  if (ahead > TX_RING_WORDS * 3 / 4) { tx_w = (rd + TX_LEAD) % TX_RING_WORDS; ahead = TX_LEAD; g_tx_under++; }   // DMA-ul ne-a depășit
+  if (g_tx_src == TXS_TONE) {                        // tonul se generează aici, cât e loc
+    static float ph = 0;
+    float w = 2 * (float)M_PI * g_tx_tone_hz / 48000.0f * (g_mode == MODE_LSB ? -1 : 1);
+    while (ahead < TX_LEAD) {
+      ph += w; if (ph > (float)M_PI) ph -= 2 * (float)M_PI; if (ph < -(float)M_PI) ph += 2 * (float)M_PI;
+      tx_put(g_tx_level * cosf(ph), g_tx_level * sinf(ph)); ahead++;
+    }
+  } else {
+    while (ahead < TX_LEAD_MIN) { tx_put(0, 0); ahead++; g_tx_under++; }   // microfonul a rămas în urmă
+  }
+}
+
+static void tx_status() {
+  if (g_tx_on)
+    Serial.printf("TX EMITE %.1f s / max %d s | %lu Hz %s | sursa %s | drive %d/15 | cuvinte %lu/s | sub %lu peste %lu | "
+                  "mic varf %.1f dBFS (castig %+d dB) | RX propriu: +%.0f Hz %.1f dB, -%.0f Hz %.1f dB | Q %s\n",
+                  (millis() - g_tx_t0) / 1000.0, g_tx_timeout_s, (unsigned long)g_freq, MODE_NAME[g_mode], TXS_NAME[g_tx_src],
+                  g_tx_drive, (unsigned long)g_tx_rate, (unsigned long)g_tx_under, (unsigned long)g_tx_over,
+                  20 * log10f(g_tx_mic_pk + 1e-9f), g_tx_mic_db, (double)g_tx_tone_hz, (double)g_tx_probe_pos,
+                  (double)g_tx_tone_hz, (double)g_tx_probe_neg, g_tx_qneg ? "negat" : "normal");
+  else
+    Serial.printf("TX oprit | drive %d/15 | max %d s | mic %+d dB | banda %s | PTT: boot %d tasta %d cat %d usb %d tune %d%s\n",
+                  g_tx_drive, g_tx_timeout_s, g_tx_mic_db, tx_band_ok(g_freq) ? "OK" : "INTERZISA",
+                  g_ptt_boot, g_ptt_key, g_ptt_cat, g_ptt_usb, g_tune_req, g_tx_lock ? " | BLOCAT pana la eliberarea PTT" : "");
+  g_tx_mic_pk = 0;
 }
 
 // ============================================================
@@ -774,6 +1103,8 @@ static void radio_start() {
     rb_cmd(0x00, RB_REG0); rb_cmd(0x02, rb_freq()); rb_cmd(0x04, rb_freq()); rb_cmd(0x14, rb_gain_word());
     g_gain_sent = g_gain_db;
     if (!rx_pio_start()) g_fpga = -3;               // fără PIO/DMA liber: niciun eșantion
+    tx_dsp_init();
+    if (!tx_hw_init()) tx_dma = -1;                  // fără TX, recepția merge mai departe
   }
   g_ui_ready = true;
 }
@@ -880,7 +1211,8 @@ static void cat_cmd(const char *c) {
   else if (a == 'S' && b == 'M') {                  // S-metru 0..30 (TS-2000), din dBFS: zgomot ~-110 -> 0
     int v = (int)((g_smeter_db + 110) / 2); if (v < 0) v = 0; if (v > 30) v = 30;
     snprintf(r, sizeof(r), "SM0%04d;", v); Serial.print(r);
-  } else if ((a == 'T' && b == 'X') || (a == 'R' && b == 'X')) { /* fără emisie */ }
+  } else if (a == 'T' && b == 'X') g_ptt_cat = true;   // TX; TX0; TX1: emisie (sursa = microfonul / tonul modului)
+  else if (a == 'R' && b == 'X') g_ptt_cat = false;
   else if (!n) Serial.print("?;");                  // interogare necunoscută
   // setare necunoscută: Kenwood nu răspunde nimic
 }
@@ -929,6 +1261,25 @@ static void freed_pin_test() {
 
 static void handle_cmd(const char *s) {
   if (s[0] == 'i') { pin_activity(); return; }
+  if (s[0] == 't') {                                  // TX: t | t1 t0 | tt | td<0-15> | tg<dB> | to<s> | tq
+    long a = atol(s + 2);
+    switch (s[1]) {
+      case '1': g_ptt_usb = true; break;
+      case '0': g_ptt_usb = g_ptt_cat = g_tune_req = false; break;
+      case 't': g_tune_req = !g_tune_req; break;
+      case 'd': g_tx_drive = constrain(a, 0, 15); g_tx_drive_dirty = true; break;
+      case 'g': g_tx_mic_db = constrain(a, -20, 30); break;
+      case 'o': g_tx_timeout_s = constrain(a, 5, 600); break;
+      case 'q': g_tx_qneg = !g_tx_qneg; break;
+      case 'b': g_boot_ptt = a != 0; break;           // tb1 / tb0: BOOT ca PTT
+    }
+    if (s[1] == '1' || s[1] == 't') {                 // lasă bucla să pornească emisia, apoi arată starea
+      uint32_t t0 = millis();
+      while (millis() - t0 < 300) { if (g_fpga == 1) rx_poll(); audio_out_pump(); tx_poll(); }
+    }
+    tx_status();
+    return;
+  }
   if (s[0] == 'u') { if (g_wm == 1) Serial.println("u: GP16/GP23 sunt ale WM8960 acum"); else freed_pin_test(); return; }
   if (s[0] == 'a') {                                  // WM8960: a | ah<reg> | as<reg> | am<pga> | ab<boost> | al1/al0
     long a = atol(s + 2);
@@ -939,6 +1290,28 @@ static void handle_cmd(const char *s) {
       case 'b': g_wm_boost = constrain(a, 0, 3); g_wm_mic_req = 1; break;
       case 'l': g_mic_loop = a != 0; break;
       case 'u': g_mic_usb = constrain(a, 0, 2); break;
+      case 'X': g_wm_stop_req = true; break;          // test: codec resetat = fără ceasuri pe fire
+      case 'R': {                                     // reinițializare completă (registre pierdute pe I2C)
+        g_wm_retry = 1; uint32_t t0 = millis();
+        while (g_wm_retry != 2 && millis() - t0 < 3000) { if (g_fpga == 1) rx_poll(); audio_out_pump(); }
+        Serial.printf("WM8960 reinit: %s\n", g_wm_init == 1 ? "OK" : "ESUAT");
+        g_wm_retry = 0;
+        wm_pio_resync();
+        break;
+      }
+    }
+    if (s[1] == 'd') {                                // cine ține SDA jos? (rulează pe nucleul 0)
+      uint32_t b0 = g_core1_beat; delay(500); uint32_t b1 = g_core1_beat;
+      int sda_i2c = gpio_get(PIN_OLED_SDA), scl_i2c = gpio_get(PIN_OLED_SCL);
+      gpio_set_function(PIN_OLED_SDA, GPIO_FUNC_SIO); gpio_set_dir(PIN_OLED_SDA, GPIO_IN);
+      gpio_set_function(PIN_OLED_SCL, GPIO_FUNC_SIO); gpio_set_dir(PIN_OLED_SCL, GPIO_IN);
+      delayMicroseconds(100);
+      int sda_free = gpio_get(PIN_OLED_SDA), scl_free = gpio_get(PIN_OLED_SCL);
+      gpio_set_function(PIN_OLED_SDA, GPIO_FUNC_I2C); gpio_set_function(PIN_OLED_SCL, GPIO_FUNC_I2C);
+      Serial.printf("nucleul 1: %lu treceri in 0,5 s (%s) | cu I2C: SDA %d SCL %d | pinii eliberati de RP2350: SDA %d SCL %d => %s\n",
+                    (unsigned long)(b1 - b0), b1 != b0 ? "ruleaza" : "BLOCAT", sda_i2c, scl_i2c, sda_free, scl_free,
+                    sda_free ? (sda_i2c ? "magistrala libera" : "SDA era tinut de RP2350 (I2C blocat)") : "SDA tinut de un cip EXTERN / scurt la masa");
+      return;
     }
     if (s[1] == 'i') {                                // rezultatul scanării îl scrie nucleul 1
       // nivelul liniilor, citit de aici: dacă nucleul 1 e blocat pe I2C, măcar vedem cine ține magistrala jos
@@ -946,17 +1319,14 @@ static void handle_cmd(const char *s) {
       for (int k = 0; k < 1000; k++) { sda += gpio_get(PIN_OLED_SDA); scl += gpio_get(PIN_OLED_SCL); delayMicroseconds(10); }
       Serial.printf("I2C linii (10 ms): SDA sus %d%%, SCL sus %d%%  (normal ~100%% in repaus; 0%% = tinuta la masa)\n", sda / 10, scl / 10);
       if (g_i2c_recover_pulses >= 0) Serial.printf("la pornire SDA era blocat: deblocat dupa %d impulsuri SCL\n", g_i2c_recover_pulses);
+      Serial.printf("deblocari I2C in functionare: %lu\n", (unsigned long)g_i2c_fixes);
       g_i2c_scan = true; return;
     }
     if (s[1] == 'r') {
       if (g_wm == 1) { Serial.println("WM8960 merge deja"); return; }
-      g_wm_retry = 1; uint32_t t0 = millis();
-      while (g_wm_retry != 2 && millis() - t0 < 3000) { if (g_fpga == 1) rx_poll(); audio_out_pump(); }
-      if (g_wm_init == 1) {
-        i2s.end();                                    // PCM5102A eliberează GP4/GP5 (devin intrări de ceas)
-        g_wm = wm_pio_start() ? 1 : -2;               // ia și GP16/GP23 (pio_gpio_init)
-      }
-      g_wm_retry = 0;
+      if (g_wm_retry == 0) g_wm_retry = 1;
+      uint32_t t0 = millis();
+      while (g_wm != 1 && millis() - t0 < 3000) { if (g_fpga == 1) rx_poll(); audio_out_pump(); wm_hot_poll(); }
     }
     if (s[1]) {                                       // nucleul 1 scrie pe I2C între două desene; sunetul curge mai departe
       uint32_t t0 = millis();
@@ -1052,6 +1422,8 @@ void loop() {
 
   if (g_fpga == 1) rx_poll();
   audio_out_pump();
+  wm_hot_poll();
+  tx_poll();
 
   if (g_mode_dirty) {
     g_mode_dirty = false;
@@ -1124,6 +1496,15 @@ static int band_of(uint32_t f) {
   for (int b = 0; b < NBANDS; b++) if (f >= BANDS[b].lo && f <= BANDS[b].hi) return b;
   return -1;
 }
+
+// emisie permisă doar în benzile de radioamator (nu radiodifuziune, nu CB)
+static bool tx_band_ok(uint32_t f) {
+  int b = band_of(f);
+  if (b < 0) return false;
+  const char *n = BANDS[b].name;                     // doar benzile de radioamator
+  return strcmp(n, "49m") && strcmp(n, "41m") && strcmp(n, "31m") && strcmp(n, "CB");
+}
+
 
 static void band_step(int dir) {
   uint32_t f = g_freq;
@@ -1264,16 +1645,41 @@ static void i2c_bus_recover() {
   g_i2c_recover_pulses = n;
 }
 
+// Deblocare în timpul funcționării: SDA ținut jos la 3 verificări la rând (la 100 ms, între tranzacții —
+// I2C-ul e doar al nucleului 1) -> I2C oprit, impulsuri SCL + STOP, I2C și OLED repornite.
+// Văzut 22 oct după pornire de la zero: WM8960, care termină pornirea după placă, rămâne cu SDA jos în mijlocul
+// unei transmisii spre OLED; atingerea unui pin cu degetul dădea „ceasul" care îl elibera.
+static void i2c_runtime_recover() {
+  Wire1.end();
+  i2c_bus_recover();
+  Wire1.setSDA(PIN_OLED_SDA); Wire1.setSCL(PIN_OLED_SCL); Wire1.setClock(I2C_HZ); oled.setBusClock(I2C_HZ);
+  oled.begin();                                      // pornește și Wire1; OLED-ul poate fi rămas la jumătatea unei comenzi
+  g_i2c_fixes++;
+}
+static void i2c_watchdog() {
+  static uint32_t t = 0; static int low = 0;
+  if (millis() - t < 100) return;
+  t = millis();
+  if (gpio_get(PIN_OLED_SDA)) { low = 0; return; }
+  if (++low >= 3) { low = 0; i2c_runtime_recover(); }
+}
+
 void setup1() {
   pinMode(PIN_ENC_A, INPUT_PULLUP);
   pinMode(PIN_ENC_B, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), enc_isr, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), enc_isr, CHANGE);
   i2c_bus_recover();
-  Wire1.setSDA(PIN_OLED_SDA); Wire1.setSCL(PIN_OLED_SCL); Wire1.setClock(400000);
+  Wire1.setSDA(PIN_OLED_SDA); Wire1.setSCL(PIN_OLED_SCL); Wire1.setClock(I2C_HZ); oled.setBusClock(I2C_HZ);
   oled.begin();
-  // WM8960 pe același I2C: nucleul 0 așteaptă rezultatul în audio_out_begin()
-  g_wm = (wm8960_probe(Wire1) && wm8960_init(Wire1)) ? 1 : -1;
+  // WM8960 pe același I2C: nucleul 0 așteaptă rezultatul în audio_out_begin(). La pornire „la rece" (HAT-ul
+  // alimentat odată cu placa) codecul răspunde abia după un timp -> se încearcă până la 2 s, cu deblocare.
+  bool found = false;
+  for (uint32_t t0 = millis(); millis() - t0 < 2000; delay(100)) {
+    if (!gpio_get(PIN_OLED_SDA)) i2c_runtime_recover();
+    if ((found = wm8960_probe(Wire1))) break;
+  }
+  g_wm = (found && wm8960_init(Wire1)) ? 1 : -1;
   if (g_wm == 1) {                                   // volumele și microfonul salvate în flash
     uint32_t t0 = millis();
     while (!g_settings_loaded && millis() - t0 < 1000) delay(1);
@@ -1285,8 +1691,12 @@ static void i2c_scan() {
   Serial.print("I2C (GP2/GP3):");
   int n = 0;
   for (int a = 0x08; a < 0x78; a++) {
-    Wire1.beginTransmission(a);
-    if (Wire1.endTransmission() == 0) { Serial.printf(" 0x%02X%s", a, a == 0x1A ? "(WM8960)" : a == 0x3C ? "(OLED)" : ""); n++; }
+    if (a == WM8960_ADDR) continue;                 // codecul nu se poate citi; verificat separat mai jos
+    // citire de 1 octet: fără „probe"-ul bit-bang al Wire
+    if (Wire1.requestFrom(a, 1) == 1) { Wire1.read(); Serial.printf(" 0x%02X%s", a, a == 0x3C ? "(OLED)" : ""); n++; }
+  }
+  if (g_wm == 1) {                                   // WM8960: rescrie volumul căștilor (inofensiv) și vezi dacă confirmă
+    if (wm8960_set_hp(Wire1, g_wm_hp)) { Serial.print(" 0x1A(WM8960)"); n++; }
   }
   Serial.println(n ? "" : " nimic");
 }
@@ -1294,6 +1704,14 @@ static void i2c_scan() {
 // cererile de la comenzile USB („a…") se execută aici: I2C-ul e al nucleului 1 (OLED-ul e pe același bus)
 static void wm_requests() {
   if (g_i2c_scan) { g_i2c_scan = false; i2c_scan(); }
+  if (g_wm_stop_req) {                               // reset = codec slave, fără ceasuri; se repetă până confirmă
+    g_wm_stop_req = false;
+    for (int k = 0; k < 10; k++) {
+      if (!gpio_get(PIN_OLED_SDA)) i2c_runtime_recover();
+      Wire1.beginTransmission(WM8960_ADDR); Wire1.write((uint8_t)(0x0F << 1)); Wire1.write((uint8_t)0);
+      if (Wire1.endTransmission() == 0) { Serial.printf("WM8960 resetat (ceasuri oprite) la incercarea %d\n", k + 1); break; }
+    }
+  }
   if (g_wm_retry == 1) {
     g_wm_init = (wm8960_probe(Wire1) && wm8960_init(Wire1)) ? 1 : -1;
     if (g_wm_init == 1) { wm8960_set_hp(Wire1, g_wm_hp); wm8960_set_spk(Wire1, g_wm_spk); wm8960_set_mic(Wire1, g_wm_pga, g_wm_boost); }
@@ -1316,8 +1734,11 @@ static void wm_requests() {
 // Limitele dintre ferestre sunt la mijloc (geometric); comanda USB „k" arată timpul măsurat.
 // Măsurat pe placă (2 oct 2026, cu un pull-up de ~10k rămas pe nod): SW 0 | MOD 600-860 | BANDA 2275-3050 µs.
 // Limitele = medii geometrice între grupuri, cu marjă ≥1,6x; FILTRU/PAS nemăsurate (încă nemontate).
-static const uint32_t KEY_LIM_US[] = { 100, 1500, 5000, 10000, 20000 };  // SW | MOD | BANDA | FILTRU | PAS
-static const int      KEY_OF[]     = { K_SW, K_MOD, K_BAND, K_FILT, K_STEP };
+// 22 oct: butonul PTT (4,7 kΩ) se măsoară mult mai lent decât era calculat, din cauza pull-up-ului de ~10 kΩ rămas
+// pe nod (cade în fereastra PAS). PAS nu e montat -> tot ce trece de 5 ms e PTT; limita urcă la 40 ms ca PTT-ul
+// ținut să nu fie citit din când în când ca „eliberat".
+static const uint32_t KEY_LIM_US[] = { 100, 1500, 5000, 10000, 40000 };  // SW | MOD | BANDA | PTT | PTT
+static const int      KEY_OF[]     = { K_SW, K_MOD, K_BAND, K_FILT, K_FILT };
 
 static void keys_detect() {
   // descarcă C, apoi lasă pull-up-ul (~50 kΩ) să-l încarce: cu 1 µF durează ~50 ms, fără C câteva µs
@@ -1440,6 +1861,8 @@ static int draw_item(int x, int y, const char *txt, bool sel) {
 
 void loop1() {
   static uint32_t t_draw = 0, t_down = 0, t_act = 0; static bool down = false, long_done = false;
+  g_core1_beat++;
+  i2c_watchdog();
   wm_requests();
   static bool win_done = false;
   if (!win_done) { for (int k = 0; k < FFT_N; k++) win[k] = 0.5f - 0.5f * cosf(2 * (float)M_PI * k / (FFT_N - 1)); win_done = true; }
@@ -1482,7 +1905,6 @@ void loop1() {
     }
     if (key != key_prev) {                            // MOD/FILTRU/PAS la apăsare; BANDA la eliberare (lung = înapoi)
       if (key == K_MOD)  { g_mode = (g_mode + 1) % MODE_N; g_mode_dirty = true; }
-      if (key == K_FILT) { int m = g_mode; g_bw_idx[m] = (g_bw_idx[m] + 1) % bw_count(m); g_mode_dirty = true; }
       if (key == K_STEP) step_idx = (step_idx + 1) % 5;
       if (key == K_BAND) { t_kdown = t; band_long = false; }
       if (key_prev == K_BAND && !band_long) band_step(1);
@@ -1490,14 +1912,19 @@ void loop1() {
       key_prev = key;
     }
     if (key == K_BAND && !band_long && t - t_kdown > 700) { band_step(-1); band_long = true; }
+    g_ptt_key = key == K_FILT;                        // PTT: emite cât timp e ținut (4,7 kΩ)
     bool now_down = key == K_SW;
     if (now_down && !down) { t_down = t; long_done = false; }
     if (now_down && !long_done && t - t_down > 700) { ui_sel = UI_FREQ; long_done = true; t_act = t; }
     if (!now_down && down && !long_done && t - t_down > 30) { ui_sel = (ui_sel + 1) % UI_N; t_act = t; }
     down = now_down;
   }
+  // BOOT ținut apăsat = PTT (citirea oprește scurt accesul la flash, deci doar la 40 ms)
+  static uint32_t t_boot = 0;
+  if (g_boot_ptt && g_ui_ready && millis() - t_boot >= 40) { t_boot = millis(); g_ptt_boot = BOOTSEL; }
+  if (!g_boot_ptt) g_ptt_boot = false;
   if (ui_sel != UI_FREQ && millis() - t_act > 6000) ui_sel = UI_FREQ;
-  settings_poll();
+  if (!g_tx_on) settings_poll();                      // nu se scrie în flash în timpul emisiei
 
 
   // spectru: cere un bloc nou, procesează-l când e gata
@@ -1506,6 +1933,7 @@ void loop1() {
 
   if (millis() - t_draw < 80) return;
   t_draw = millis();
+  if (!gpio_get(PIN_OLED_SDA)) i2c_runtime_recover();   // nu desena pe o magistrală blocată (fiecare transfer ar expira)
   char l[24];
   uint32_t f = g_freq;
   oled.clearBuffer();
@@ -1522,6 +1950,11 @@ void loop1() {
   snprintf(l, sizeof(l), "%4.0f", g_smeter_db); oled.drawStr(108, 8, l);
 
   spectrum_draw();
+  if (g_tx_on) {                                     // indicator de emisie peste numele benzii
+    oled.setDrawColor(1); oled.drawBox(92, 0, 36, 11); oled.setDrawColor(0);
+    oled.setFont(u8g2_font_6x10_tf); oled.drawStr(95, 9, g_tune_req ? "TUNE" : " TX "); oled.setDrawColor(1);
+    oled.setFont(u8g2_font_5x7_tf);
+  }
 
   // rândul de jos: pas, volum, câștig, filtru — sau squelch / NR când sunt selectate în meniu
   int x = 0;
