@@ -138,6 +138,7 @@ static volatile bool     g_tx_lock = false;         // refuz / timp maxim: se a�
 static volatile int      g_tx_drive = 4;            // 0..15 (RagchewBerry pornește cu 4)
 static volatile bool     g_tx_drive_dirty = false;
 static volatile int      g_tx_mic_db = 0;           // câștig digital al microfonului la emisie
+static volatile int      g_mic_src = 0;             // microfonul la emisie: 0 = L+R, 1 = L (LINPUT1), 2 = R (RINPUT1)
 static volatile bool     g_tx_qneg = true;          // Radioberry: spectrul TX inversat (ca la RagchewBerry)
 static void tx_mic48(int16_t s);
 static void tx_rx_probe(float i, float q);
@@ -574,7 +575,9 @@ static void audio_in_poll() {
     uint32_t f = wm_rx[wm_rx_rd]; wm_rx_rd = (wm_rx_rd + 1) % WM_RING_WORDS; n++;
     int16_t l = (int16_t)(f >> 16), r = (int16_t)f;
     if (abs(l) > pl) pl = abs(l); if (abs(r) > pr) pr = abs(r);
-    if (g_tx_on) { if (g_tx_src != TXS_TONE) tx_mic48((int16_t)(((int32_t)l + r) / 2)); }
+    if (g_tx_on) {
+      if (g_tx_src != TXS_TONE) tx_mic48(g_mic_src == 1 ? l : g_mic_src == 2 ? r : (int16_t)(((int32_t)l + r) / 2));
+    }
     else if (g_mic_loop && (aq_w - aq_r + AQ) % AQ < AQ - 1) aq_put((int16_t)(((int32_t)l + r) / 2));
     if (g_mic_usb) usb_audio_push48k(g_mic_usb == 1 ? l : r);
   }
@@ -1531,7 +1534,7 @@ struct Settings {
   uint32_t freq;
   uint8_t  mode, step, vol; int8_t gain;
   uint8_t  bw[8];                                   // fix 8: loc pentru moduri noi fără schimbarea structurii
-  int8_t   sql; uint8_t nr; uint8_t rsv[2]; int32_t cal_ppb;    // cal_ppb: fost rezervă (0); rsv[0] = drive TX + 1
+  int8_t   sql; uint8_t nr; uint8_t rsv[2]; int32_t cal_ppb;    // cal_ppb: fost rezervă (0); rsv[0] = drive TX + 1, rsv[1] = sursa mic + 1
   uint32_t band_f[NBANDS];
   uint8_t  band_mode[NBANDS];
   uint8_t  wm_hp, wm_spk, wm_pga, wm_boost;          // WM8960 (RBS4): registre căști/difuzor, PGA și boost microfon
@@ -1560,6 +1563,7 @@ static void settings_snapshot(Settings &x) {
   x.vol = g_vol; x.gain = g_gain_db; x.sql = g_sql; x.nr = g_nr; x.cal_ppb = g_cal_ppb;
   x.wm_hp = g_wm_hp; x.wm_spk = g_wm_spk; x.wm_pga = g_wm_pga; x.wm_boost = g_wm_boost;
   x.rsv[0] = (uint8_t)(g_tx_drive + 1);             // drive TX + 1 (0 = setări vechi, rămâne implicit 4)
+  x.rsv[1] = (uint8_t)(g_mic_src + 1);              // sursa microfonului + 1 (0 = setări vechi -> L+R)
   for (int m = 0; m < MODE_N; m++) x.bw[m] = g_bw_idx[m];
   for (int b = 0; b < NBANDS; b++) { x.band_f[b] = BANDS[b].f; x.band_mode[b] = BANDS[b].mode; }
   x.sum = settings_sum(x);
@@ -1575,6 +1579,7 @@ static void settings_load() {
     if (x.wm_pga <= 63) g_wm_pga = x.wm_pga;
     if (x.wm_boost <= 3) g_wm_boost = x.wm_boost;
     if (x.rsv[0] >= 1 && x.rsv[0] <= 16) g_tx_drive = x.rsv[0] - 1;
+    if (x.rsv[1] >= 1 && x.rsv[1] <= 3) g_mic_src = x.rsv[1] - 1;
   } else {                                           // setări RBS3: aceleași câmpuri până la band_mode
     SettingsV3 o; EEPROM.get(0, o);
     uint32_t h = 2166136261u; const uint8_t *b = (const uint8_t *)&o;
@@ -1760,7 +1765,18 @@ static int keys_read() {
   return K_NONE;                                         // eliberat chiar în timpul măsurării
 }
 
-enum { UI_FREQ, UI_STEP, UI_MODE, UI_FILT, UI_BAND, UI_VOL, UI_GAIN, UI_SQL, UI_NR, UI_CAL, UI_DRIVE, UI_MIC, UI_N };
+enum { UI_FREQ, UI_STEP, UI_MODE, UI_FILT, UI_BAND, UI_VOL, UI_GAIN, UI_SQL, UI_NR, UI_CAL, UI_DRIVE, UI_MIC, UI_MICSRC, UI_N };
+static const int MIC_BOOST_DB[4] = { 0, 13, 20, 29 };
+static const char *MIC_SRC_NAME[3] = { "L+R", "L", "R" };
+// MIC: câștig analogic continuu −17,25 … +59 dB = boost (0/13/20/29 dB) + PGA (−17,25 … +30 dB, 0,75 dB/treaptă).
+// Pasul e 1,5 dB pe PGA; la capătul PGA se schimbă boost-ul și PGA-ul se compensează (fără salt de nivel).
+// Jos (boost 0) pentru semnal de linie (ex. modul MAX4466), sus pentru capsule electret / MEMS.
+static void mic_gain_step(int d) {
+  int pga = g_wm_pga + 2 * d, boost = g_wm_boost;
+  while (pga > 63 && boost < 3) { pga -= (int)lroundf((MIC_BOOST_DB[boost + 1] - MIC_BOOST_DB[boost]) / 0.75f); boost++; }
+  while (pga < 0 && boost > 0)  { pga += (int)lroundf((MIC_BOOST_DB[boost] - MIC_BOOST_DB[boost - 1]) / 0.75f); boost--; }
+  g_wm_pga = constrain(pga, 0, 63); g_wm_boost = boost; g_wm_mic_req = 1;
+}
 static int ui_sel = UI_FREQ;
 
 // ---------------- spectru + waterfall ----------------
@@ -1883,7 +1899,8 @@ void loop1() {
       case UI_NR: g_nr = constrain(g_nr + (int)d, 0, 3); break;
       case UI_CAL: g_cal_ppb = constrain(g_cal_ppb + 100 * (int)d, -200000, 200000); g_freq_dirty = true; break;   // 0,1 ppm
       case UI_DRIVE: g_tx_drive = constrain(g_tx_drive + (int)d, 0, 15); g_tx_drive_dirty = true; break;
-      case UI_MIC: g_wm_pga = constrain(g_wm_pga + 2 * (int)d, 0, 63); g_wm_mic_req = 1; break;   // 1,5 dB/pas, se aplică pe I2C
+      case UI_MIC: mic_gain_step((int)d); break;      // 1,5 dB/pas, se aplică pe I2C (nucleul 1)
+      case UI_MICSRC: g_mic_src = ((g_mic_src + (int)d) % 3 + 3) % 3; break;
     }
   }
   if (g_ui_ready) {                                   // butonul e pe DCLK: doar după configurare
@@ -1968,9 +1985,15 @@ void loop1() {
 
   // rândul de jos: pas, volum, câștig, filtru — sau squelch / NR când sunt selectate în meniu
   int x = 0;
+  if (ui_sel == UI_MICSRC) {                         // ce microfon intră în emisie
+    snprintf(l, sizeof(l), "MIC SRC %s", MIC_SRC_NAME[g_mic_src]);
+    x = draw_item(1, 63, l, true);
+    oled.drawStr(x + 2, 63, g_mic_src == 1 ? "LINPUT1" : g_mic_src == 2 ? "RINPUT1" : "ambele");
+    oled.sendBuffer();
+    return;
+  }
   if (ui_sel == UI_MIC) {                            // sensibilitatea microfonului: câștig analogic total în codec
-    static const int BOOST_DB[4] = { 0, 13, 20, 29 };
-    float db = BOOST_DB[g_wm_boost & 3] + (-17.25f + 0.75f * g_wm_pga);
+    float db = MIC_BOOST_DB[g_wm_boost & 3] + (-17.25f + 0.75f * g_wm_pga);
     snprintf(l, sizeof(l), "MIC %+.1fdB", (double)db);
     x = draw_item(1, 63, l, true);
     float pk = g_tx_on ? 20 * log10f(g_tx_mic_pk + 1e-9f) : -99;   // în emisie: vârful vocii
