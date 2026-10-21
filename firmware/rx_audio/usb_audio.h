@@ -5,5 +5,6 @@
 
 void usb_audio_begin();              // în setup(), înainte de Serial.begin()
 void usb_audio_push12k(float x);     // un eșantion demodulat la 12 kHz, nivel ~±1 (fără volumul căștilor)
+void usb_audio_push48k(int16_t x); // eșantion la 48 kHz (microfonul WM8960 pe USB, test)
 bool usb_audio_streaming();          // PC-ul citește acum de pe „microfon"
 uint32_t usb_audio_drops();          // eșantioane aruncate (FIFO USB plin)

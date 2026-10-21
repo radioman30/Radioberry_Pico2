@@ -71,7 +71,8 @@ Adafruit TinyUSB, U8g2. Toate rămân ale autorilor lor, sub licențele lor.
 - Bara de jos: pas, volum, câștig, filtru; indicatori Q (squelch), N (NR), RC (butoane)
 
 **Placa de sunet**
-- **Căști:** DAC I2S **PCM5102A**, 48 kHz, volum 0–100
+- **WM8960 Audio HAT** (codec master, 48 kHz din cristalul lui de 24 MHz): **difuzoare** + **căști**, volum 0–100;
+  **microfoanele** HAT-ului citite de RP2350 (pentru emisie). Fără HAT, firmware-ul trece singur pe **PCM5102A**
 - **USB:** microfon **„Radioberry RX audio”**, 48 kHz mono, audio demodulat la nivel fix
   (independent de volumul căștilor și de squelch) → WSJT-X, fldigi, înregistrare
 
@@ -92,7 +93,7 @@ Adafruit TinyUSB, U8g2. Toate rămân ale autorilor lor, sub licențele lor.
 |---|---|
 | Procesor | Waveshare **RP2350-PiZero** (RP2350B, 2× Cortex-M33 @150 MHz, 16 MB flash) |
 | Radio | **Radioberry v2, Cyclone 10 LP 10CL025** + AD9866 (doar CL025 testat) |
-| Audio | modul **PCM5102A** (I2S) + căști |
+| Audio | **Waveshare WM8960 Audio HAT** (legat cu fire, nu înfipt) — sau, ca rezervă, modul PCM5102A |
 | Afișaj | OLED 1,3" 128×64, I2C |
 | Comenzi | encoder rotativ cu buton + butoanele MOD și BANDA |
 | Alimentare | 5 V / 2 A extern |
@@ -109,18 +110,26 @@ Numerele GP de mai jos sunt GPIO-uri RP2350 — pe PiZero **nu** coincid mereu c
 
 | Pin header | GP | Funcție | Se leagă la |
 |---|---|---|---|
-| 1 | — | 3V3 | PCM5102A VIN, OLED VCC |
-| 3 | GP2 | I2C SDA | OLED SDA |
-| 5 | GP3 | I2C SCL | OLED SCL |
-| 7 | GP14 | I2S DATA | PCM5102A DIN |
-| 8 | GP4 | I2S BCK | PCM5102A BCK |
-| 10 | GP5 | I2S LRCK | PCM5102A LCK |
+| 1 | — | 3V3 | OLED VCC |
+| 2 | — | 5V | WM8960 HAT pin 2 (5V) |
+| 3 | GP2 | I2C SDA | OLED SDA **și** HAT pin 3 (WM8960 0x1A, OLED 0x3C) |
+| 5 | GP3 | I2C SCL | OLED SCL **și** HAT pin 5 |
+| 8 | GP4 | I2S BCLK (intrare, de la codec) | HAT pin 12 |
+| 10 | GP5 | I2S LRCLK (intrare, de la codec) | HAT pin 35 |
+| 16 | GP23 | ADCDAT (microfon) | HAT pin 38 |
+| 36 | GP16 | DACDAT (difuzor/căști) | HAT pin 40 |
 | 18 | GP24 | rețeaua de butoane (RC) | encoder SW, MOD, BANDA — vezi mai jos |
 | 27 | GP0 | encoder A | encoder CLK |
 | 28 | GP1 | encoder B | encoder DT |
-| GND | — | masă | PCM5102A, OLED, encoder, butoane |
+| GND | — | masă | HAT pin 6, OLED, encoder, butoane |
 
-**PCM5102A:** SCK → GND, XSMT → 3V3, FLT / DEMP / FMT → GND.
+**WM8960 HAT:** se leagă **doar** pinii din tabel. **Nu** se înfige peste Radioberry și **nu** cu panglică de 40:
+pinii lui I2S (12/35/38/40) ar cădea pe liniile de date RX ale Radioberry. Butonul HAT-ului (pin 11) nu se leagă.
+Pinul 7 (GP14) rămâne liber: e rezervat pentru TX (BCM4 = TX_CLK în gateware-ul PIO).
+GP16/GP23 au în FPGA doar un pull-up slab (verificat cu comanda `u`); 330 Ω în serie pe ele e o protecție bună.
+
+**Rezervă PCM5102A** (dacă HAT-ul lipsește): DIN → pin 7 (GP14), BCK → 8, LCK → 10, VIN → 3V3;
+SCK → GND, XSMT → 3V3, FLT / DEMP / FMT → GND.
 **Encoder:** comunul la GND; pinul „+” al modulului **nelegat** (pull-up-urile lui încurcă butoanele).
 
 ### Folosiți de Radioberry (nu legi nimic)
@@ -196,6 +205,12 @@ pe placă filtru 2,7 kHz.
 | `z<start,stop,pas kHz>` | baleiaj |
 | `q1` / `q0` | flux IQ pornit / oprit |
 | `k` / `kd` | stare / diagnostic butoane |
+| `a` | stare WM8960 (cadre/s, vârf microfon, rezervă DAC) |
+| `ah<0,48-127>` / `as<…>` | volum căști / difuzor (121 = 0 dB, 1 dB/pas, 0 = oprit) — se salvează |
+| `am<0-63>` / `ab<0-3>` | PGA microfon (−17,25 + 0,75·n dB) / boost (0, 13, 20, 29 dB) — se salvează |
+| `al1` / `al0` | test: microfoanele în difuzoare/căști în locul radioului |
+| `au1` / `au2` / `au0` | test: microfonul stâng / drept pe microfonul USB în locul radioului |
+| `ai` / `ar` | scanare I2C + nivelul liniilor / repornește WM8960 fără restart |
 
 ---
 
@@ -218,7 +233,6 @@ pe placă filtru 2,7 kHz.
 
 ## ÎN LUCRU
 
-- **WM8960 Audio HAT** în locul PCM5102A — căști + microfon pentru emisie
 - **TX** (SSB / CW / AM / FM), primul test pe sarcină artificială 50 Ω
 - Butoane FILTRU și PAS pe aceeași rețea RC (pregătite în firmware)
 

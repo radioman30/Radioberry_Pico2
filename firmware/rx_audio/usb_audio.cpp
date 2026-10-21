@@ -64,6 +64,19 @@ void usb_audio_push12k(float x) {
   }
 }
 
+// eșantion gata la 48 kHz (microfonul WM8960, pentru test: comanda au1)
+void usb_audio_push48k(int16_t x) {
+  static int16_t buf[48];
+  static int n = 0;
+  if (!streaming) { n = 0; return; }
+  buf[n++] = mute ? 0 : x;
+  if (n >= 48) {
+    uint16_t w = tud_audio_write(buf, n * 2);
+    if (w < n * 2) drops += (n * 2 - w) / 2;
+    n = 0;
+  }
+}
+
 // ---------------- callback-uri TinyUSB (cereri de control UAC2) ----------------
 
 bool tud_audio_set_itf_cb(uint8_t, tusb_control_request_t const *p_request) {

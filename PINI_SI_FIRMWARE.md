@@ -33,17 +33,17 @@ GP = numărul GPIO al RP2350 (pe PiZero NU e mereu egal cu BCM).
 |---|---|---|---|---|
 | 1 | 3V3 | — | alimentare | PCM5102A **VIN**, OLED **VCC** |
 | 2, 4 | 5V | — | alimentare Radioberry | — |
-| 3 | 2 | **2** | I2C SDA | OLED **SDA** |
-| 5 | 3 | **3** | I2C SCL | OLED **SCL** |
+| 3 | 2 | **2** | I2C SDA | OLED **SDA** + HAT pin 3 |
+| 5 | 3 | **3** | I2C SCL | OLED **SCL** + HAT pin 5 |
 | 6, 9, 14, 20, 25, 30, 34, 39 | GND | — | masă | GND PCM5102A, OLED, encoder, butoane, condensator |
-| 7 | 4 | **14** | I2S DATA | PCM5102A **DIN** |
-| 8 | 14 | **4** | I2S BCK | PCM5102A **BCK** |
-| 10 | 15 | **5** | I2S LRCK | PCM5102A **LCK** |
+| 7 | 4 | **14** | liber cu WM8960 — rezervat TX_CLK (gateware PIO) | (doar rezerva PCM5102A **DIN**) |
+| 8 | 14 | **4** | I2S BCLK (intrare, codecul e master) | HAT pin 12 |
+| 10 | 15 | **5** | I2S LRCLK (intrare) | HAT pin 35 |
 | 11 | 17 | 17 | ieșire FPGA (`pi_cwl`) | **NU LEGA** |
 | 12 | 18 | 18 | Radioberry: date RX D0 (PIO) | — |
 | 13 | 27 | 27 | Radioberry: nCONFIG | — |
 | 15 | 22 | 22 | Radioberry: CONF_DONE | — |
-| 16 | 23 | 23 | liber (fost date RX bit 7, protocol clasic) | — (intrare; neconfirmat că FPGA nu-l comandă) |
+| 16 | 23 | 23 | fost date RX bit 7 — în FPGA doar pull-up slab (test `u`, 21 oct) | WM8960 **ADCDAT** (HAT pin 38) |
 | 17 | 3V3 | — | alimentare | ⚠️ chiar lângă pinul 18 — atenție la lipituri |
 | **18** | 24 | **24** | Radioberry: DCLK (doar la pornire) | **rețeaua de butoane** prin 470 Ω (§3) |
 | 19 | 10 | 11 | Radioberry: SPI MOSI | — |
@@ -59,7 +59,7 @@ GP = numărul GPIO al RP2350 (pe PiZero NU e mereu egal cu BCM).
 | 32 | 12 | 9 | Radioberry: TX_RDY (rezervat) | — |
 | 33 | 13 | 13 | Radioberry: DATA0 (doar la pornire) | — |
 | 35 | 19 | 19 | Radioberry: date RX D1 (PIO) | — |
-| 36 | 16 | 16 | liber (fost date RX bit 3, protocol clasic) | — (intrare; neconfirmat că FPGA nu-l comandă) |
+| 36 | 16 | 16 | fost date RX bit 3 — în FPGA doar pull-up slab (test `u`, 21 oct) | WM8960 **DACDAT** (HAT pin 40) |
 | 37 | 26 | 26 | Radioberry: nSTATUS | — |
 | 38 | 20 | 20 | Radioberry: date RX D2 (PIO) | — |
 | 40 | 21 | 21 | Radioberry: date RX D3 (PIO) | — |
@@ -150,7 +150,28 @@ condensator prin rezistența fiecăruia.
 
 ---
 
-## 7. Plănuit: WM8960 Audio HAT (intrare + ieșire audio)
+## 7. WM8960 Audio HAT — FUNCȚIONAL (21 oct 2026)
+
+**Ce merge:** codec master (PLL din cristalul de 24 MHz → 12,288 MHz; BCLK 1,536 MHz, LRCLK 48 kHz), RP2350 slave
+cu program PIO duplex propriu (`wm_pio_start()` în rx_audio.ino) + 2 DMA în inel fără IRQ; difuzoare, căști și
+microfoane verificate (48 000 cadre/s, înregistrare microfon fără date pierdute). Driverul: `wm8960.cpp/.h`.
+Setările (căști, difuzor, PGA, boost) se salvează în flash (magic RBS4; setările RBS3 se migrează).
+
+**Capcane găsite la punere în funcțiune:**
+- Biblioteca I2S din core nu poate fi slave cu intrare aici: cere DIN = BCLK − 1 = GP3 (SCL-ul OLED).
+- **SDA blocat după fiecare flash:** Pico se resetează, HAT-ul (5V din header) nu; WM8960 rămâne ținând SDA jos
+  → I2C mort, OLED stins. Rezolvat cu `i2c_bus_recover()` la pornire (impulsuri SCL + STOP).
+- Pinii I2S ai HAT-ului legați pin-la-pin (ca la un HAT înfipt) cad pe D0–D3 ale Radioberry → IQ stricat.
+- Microfonul cu boost +29 dB + PGA +12 dB prinde tot din cameră (fond −26…−33 dBFS); pentru voce: boost +13 dB.
+- Comenzile care blocau bucla principală 50 ms dădeau pârâit (rezervă DAC 16 ms) → acum rezervă 62 ms și
+  așteptări care pompează audio în continuare.
+
+
+> **Actualizare 21 oct 2026 (placa a sosit):** cu gateware-ul PIO 75.2 GP16/GP23 sunt libere, deci **DACDAT → GP16
+> (pin 36)** și **ADCDAT → GP23 (pin 16)**; varianta GPIO28/USB-C de mai jos e abandonată. GP14 (pin 7) se eliberează
+> pentru TX (BCM4 = TX_CLK în gateware-ul PIO). BCK GP4 / LRCK GP5 / I2C GP2-3 rămân. Test `u` (rx_audio, Radioberry
+> activ): ambele pini rămân 1 și cu pull-down-ul RP2350, dar trași jos 2 µs la 2 mA cobor și revin în 100–200 ns ⇒
+> **pull-up slab (~25 kΩ) al FPGA pe pinii nefolosiți, nu ieșire**. Recomandat 330 Ω în serie pe ambele linii.
 
 Sursă: [wiki Waveshare](https://www.waveshare.com/wiki/WM8960_Audio_HAT), repo clonat local în
 `referinte/WM8960-Audio-HAT` (driver Linux = referință pentru registre). HAT-ul: alimentare **5 V**, logică 3,3 V,

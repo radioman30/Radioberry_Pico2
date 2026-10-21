@@ -1,7 +1,7 @@
-// rx_audio — receptor SSB/CW/AM: Radioberry v2 (CL025) + Waveshare RP2350-PiZero + PCM5102A
+// rx_audio — receptor SSB/CW/AM/FM: Radioberry v2 (CL025) + Waveshare RP2350-PiZero + WM8960 Audio HAT (rezervă: PCM5102A)
 //
 // Lanț: FPGA (gateware PIO 75.2 din RagchewBerry/WP3DN, 4 linii + meta, citit cu PIO + DMA) -> IQ 48 kHz
-//       -> decimare /4 (12 kHz) -> filtru complex trece-bandă -> demodulare -> AGC -> I2S 12 kHz.
+//       -> decimare /4 (12 kHz) -> filtru complex trece-bandă -> demodulare -> AGC -> ×4 -> I2S 48 kHz.
 // Protocol și capcane: PROTOCOL.md §7 (§6 = vechiul protocol clasic pe 8 linii, gateware HL2 73.3).
 // Doar pe RP2350-PiZero (Radioberry înfipt în header).
 //
@@ -15,6 +15,7 @@
 //     după ultima schimbare și se reîncarcă la pornire.
 // CAT: emulare Kenwood TS-2000 pe același port (comenzi cu „;”): WSJT-X, fldigi, Omni-Rig/HDSDR.
 // USB (115200): s stare | f<Hz> frecvența | m<0-5> modul (USB LSB CW AM FM SAM) | l<dB> squelch: prag în dB peste zgomotul estimat, 1..40 (l0 = oprit) | n<0-3> reducere zgomot | c calibrare automată (în SAM, pe o stație AM) | c<ppb> calibrare manuală | v<0-100> volumul | g<-12..48> câștig RX dB | k butoane (diagnostic) | w<Hz> lățimea filtrului | x inversează IQ (LSB<->USB) | q1/q0 flux IQ binar pe USB (tools/iq_record.py)
+//   WM8960: a stare | ah<0x30-0x7F> căști (121 = 0 dB, 0 = mut) | as<reg> difuzor (0 = oprit) | am<0-63> PGA microfon | ab<0-3> boost | al1/al0 microfonul în căști (test) | au1/au2/au0 microfonul L/R pe USB în locul radioului (test)
 //
 // Ieșirea audio e izolată în audio_out_*(), ca să poată fi înlocuită (ex. CM108AH pe USB).
 
@@ -26,6 +27,7 @@
 #include <EEPROM.h>
 #include <Adafruit_TinyUSB.h>          // stiva USB „Adafruit TinyUSB": CDC + microfon USB
 #include "usb_audio.h"
+#include "wm8960.h"
 struct Settings;                    // definită mai jos; aici doar pt. prototipurile generate de Arduino
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
@@ -61,7 +63,9 @@ static const uint8_t FREED_GP[5] = { 15, 9, 13, 16, 23 };              // foste 
 #define PIN_SPI_CE1         7   //   7    7  26
 #define PIN_I2S_BCK         4   //   4   14   8   PCM5102A BCK
 #define PIN_I2S_LRCK        5   //   5   15  10   PCM5102A LCK  (= BCK + 1)
-#define PIN_I2S_DATA       14   //  14    4   7   PCM5102A DIN
+#define PIN_I2S_DATA       14   //  14    4   7   PCM5102A DIN (doar fără WM8960)
+#define PIN_I2S_DOUT       16   //  16   16  36   WM8960 DACDAT (căști)   — linie eliberată de gateware-ul PIO
+#define PIN_I2S_DIN        23   //  23   23  16   WM8960 ADCDAT (microfon) — idem
 #define PIN_OLED_SDA        2   //   2    2   3
 #define PIN_OLED_SCL        3   //   3    3   5
 #define PIN_ENC_A           0   //   0    0  27
@@ -105,6 +109,16 @@ static volatile uint8_t  g_gw_major = 0, g_gw_minor = 0;
 static volatile float    g_smeter_db = -140;
 static volatile uint32_t g_iq_rate = 0, g_audio_drop = 0, g_audio_under = 0;
 static volatile bool     g_ui_ready = false;        // nucleul 1 poate lua pinul DCLK ca buton
+// WM8960: 0 = încă nu s-a încercat, 1 = pornit (codec master, PIO duplex), -1 = lipsă -> PCM5102A
+static volatile int      g_wm = 0;
+static volatile int      g_wm_hp_req = -1, g_wm_spk_req = -1, g_wm_mic_req = -1;   // cereri I2C pt. nucleul 1
+static volatile int      g_wm_hp = 0x73, g_wm_spk = 0x70, g_wm_pga = 0x27, g_wm_boost = 3;   // implicit: căști -6 dB, difuzor -9 dB
+static volatile bool     g_mic_loop = false;        // test: microfonul WM8960 în căști în locul radioului
+static volatile int      g_mic_usb = 0;             // test: 0 = USB primește radioul, 1 = microfonul stâng WM8960, 2 = dreptul
+static volatile int      g_wm_retry = 0;            // ar: 1 = cerut, 2 = nucleul 1 a terminat init-ul (rezultat în g_wm_init)
+static volatile int      g_wm_init = 0;
+static volatile bool     g_i2c_scan = false;        // ai: scanare I2C pe nucleul 1
+static volatile int      g_i2c_recover_pulses = -1; // impulsuri SCL date la pornire ca să deblocheze SDA (-1 = n-a fost nevoie)
 
 // ============================================================
 // FPGA: încărcare passive serial (LSB primul)
@@ -408,10 +422,14 @@ static bool dsp_push(float I, float Q, float *out) {
 }
 
 // ============================================================
-// Ieșire audio (PCM5102A, I2S 48 kHz). De înlocuit aici pentru CM108AH.
-// Demodulatorul dă 12 kHz; ieșirea e la 48 kHz (interpolare liniară ×4), ca în audio_test validat:
-// cu SCK la GND, PCM5102A își face ceasul din BCK prin PLL, iar la 12 kHz (BCK 384 kHz) nu e sigur
-// că se sincronizează — pe placă, la 12 kHz se auzea doar zgomot și cu volumul pe 0.
+// Ieșire audio, 48 kHz. Demodulatorul dă 12 kHz -> interpolare liniară ×4 -> coada aq -> I2S.
+// Două variante, alese la pornire:
+//  * WM8960 (dacă răspunde pe I2C): codecul e MASTER de ceas (cristalul lui de 24 MHz), RP2350 e slave.
+//    Un program PIO duplex scrie DACDAT (GP16) și citește ADCDAT (GP23); 2 canale DMA în inel, fără IRQ
+//    (ca la IQ: handler-ele DMA crăpau firmware-ul). Biblioteca I2S din core nu merge: intrarea ei slave
+//    cere DIN = BCLK - 1 = GP3 (SCL-ul OLED-ului).
+//  * PCM5102A (fallback, ca înainte): biblioteca I2S, master, BCK GP4 / LRCK GP5 / DIN GP14.
+// Ceasul FPGA și ceasul audio diferă cu câțiva ppm: coada aq absoarbe; plină -> se aruncă, goală -> se repetă.
 // ============================================================
 static const int FS_OUT = 48000, UPS = FS_OUT / FS;
 static I2S i2s(OUTPUT);
@@ -419,29 +437,165 @@ static I2S i2s(OUTPUT);
 static int16_t aq[AQ]; static int aq_w = 0, aq_r = 0;
 static float up_prev = 0;
 
+// PIO duplex slave, 16 biți/canal, 32 BCLK/cadru. Instrucțiunile se construiesc la rulare (pinii sunt în
+// „wait gpio"). Datele: ies pe frontul căzător al BCLK, se citesc pe cel crescător; MSB la un BCLK după LRCLK.
+//   0: wait 1 gpio LRCK      sincronizare o singură dată: LRCLK cade (= începe canalul stâng) ...
+//   1: wait 0 gpio LRCK
+//   2: wait 1 gpio BCK       ... frontul crescător al bitului de întârziere (LSB-ul dreptei anterioare)
+//   3: pull noblock          <- wrap_target: un cadru = 1 cuvânt (stânga în biții 31:16); FIFO gol -> X (= 0)
+//   4: set y, 31
+//   5: wait 0 gpio BCK
+//   6: out pins, 1
+//   7: wait 1 gpio BCK
+//   8: in pins, 1            autopush la 32 biți: cuvântul = stânga<<16 | dreapta
+//   9: jmp y--, 5            <- wrap
+#define WM_RING_BITS  15                              // 32 KB = 8192 cadre = 170 ms, în fiecare direcție
+#define WM_RING_WORDS (1u << (WM_RING_BITS - 2))
+static uint32_t wm_tx[WM_RING_WORDS] __attribute__((aligned(1u << WM_RING_BITS)));
+static uint32_t wm_rx[WM_RING_WORDS] __attribute__((aligned(1u << WM_RING_BITS)));
+static uint16_t wm_prog_instr[10];
+static PIO  wm_pio; static uint wm_sm; static int wm_dma_tx = -1, wm_dma_rx = -1;
+static uint32_t wm_tx_w = 0, wm_rx_rd = 0;           // indici în inele (următorul de scris / de citit)
+static uint32_t wm_last = 0;                          // ultimul cadru scris (se repetă la goliciune)
+static volatile uint32_t g_wm_frames = 0, g_wm_rate = 0;
+static volatile int16_t  g_mic_pk_l = 0, g_mic_pk_r = 0;   // vârfuri microfon (se resetează la citire)
+
+static uint32_t wm_tx_rd() { return ((uint32_t)dma_hw->ch[wm_dma_tx].read_addr - (uint32_t)wm_tx) / 4 % WM_RING_WORDS; }
+static uint32_t wm_rx_wr() { return ((uint32_t)dma_hw->ch[wm_dma_rx].write_addr - (uint32_t)wm_rx) / 4 % WM_RING_WORDS; }
+
+static bool wm_pio_start() {
+  const uint B = PIN_I2S_BCK, L = PIN_I2S_LRCK;
+  uint16_t *p = wm_prog_instr;
+  p[0] = pio_encode_wait_gpio(true, L);  p[1] = pio_encode_wait_gpio(false, L); p[2] = pio_encode_wait_gpio(true, B);
+  p[3] = pio_encode_pull(false, false);  p[4] = pio_encode_set(pio_y, 31);
+  p[5] = pio_encode_wait_gpio(false, B); p[6] = pio_encode_out(pio_pins, 1);
+  p[7] = pio_encode_wait_gpio(true, B);  p[8] = pio_encode_in(pio_pins, 1);
+  p[9] = pio_encode_jmp_y_dec(5);        // adresă relativă: pio_add_program o relochează
+  static const struct pio_program prog = { .instructions = wm_prog_instr, .length = 10, .origin = -1 };
+
+  PIO pios[] = { pio0, pio1, pio2 };
+  int off = -1, sm = -1;
+  for (PIO pp : pios) {
+    if (!pio_can_add_program(pp, &prog)) continue;
+    if ((sm = pio_claim_unused_sm(pp, false)) < 0) continue;
+    wm_pio = pp; off = pio_add_program(pp, &prog); break;
+  }
+  if (off < 0) return false;
+  wm_sm = (uint)sm;
+
+  pio_sm_config c = pio_get_default_sm_config();
+  sm_config_set_wrap(&c, off + 3, off + 9);
+  sm_config_set_out_pins(&c, PIN_I2S_DOUT, 1);
+  sm_config_set_in_pins(&c, PIN_I2S_DIN);
+  sm_config_set_out_shift(&c, false, false, 32);     // MSB primul, fără autopull (pull noblock explicit)
+  sm_config_set_in_shift(&c, false, true, 32);       // MSB primul, autopush la 32
+  pio_gpio_init(wm_pio, PIN_I2S_DOUT);
+  pio_sm_set_consecutive_pindirs(wm_pio, wm_sm, PIN_I2S_DOUT, 1, true);
+  pio_gpio_init(wm_pio, PIN_I2S_DIN);
+  pio_sm_set_consecutive_pindirs(wm_pio, wm_sm, PIN_I2S_DIN, 1, false);
+  gpio_init(B); gpio_set_dir(B, GPIO_IN); gpio_init(L); gpio_set_dir(L, GPIO_IN);   // ceasurile vin de la codec
+  gpio_disable_pulls(PIN_I2S_DIN);
+  pio_sm_init(wm_pio, wm_sm, off, &c);
+  pio_sm_exec(wm_pio, wm_sm, pio_encode_set(pio_x, 0));
+
+  memset(wm_tx, 0, sizeof wm_tx);
+  if ((wm_dma_tx = dma_claim_unused_channel(false)) < 0) return false;
+  if ((wm_dma_rx = dma_claim_unused_channel(false)) < 0) return false;
+  dma_channel_config t = dma_channel_get_default_config(wm_dma_tx);
+  channel_config_set_transfer_data_size(&t, DMA_SIZE_32);
+  channel_config_set_read_increment(&t, true);
+  channel_config_set_write_increment(&t, false);
+  channel_config_set_ring(&t, false, WM_RING_BITS);  // adresa de citire se învârte în inel
+  channel_config_set_dreq(&t, pio_get_dreq(wm_pio, wm_sm, true));
+  dma_channel_configure(wm_dma_tx, &t, &wm_pio->txf[wm_sm], wm_tx, dma_encode_endless_transfer_count(), true);
+  dma_channel_config r = dma_channel_get_default_config(wm_dma_rx);
+  channel_config_set_transfer_data_size(&r, DMA_SIZE_32);
+  channel_config_set_read_increment(&r, false);
+  channel_config_set_write_increment(&r, true);
+  channel_config_set_ring(&r, true, WM_RING_BITS);
+  channel_config_set_dreq(&r, pio_get_dreq(wm_pio, wm_sm, false));
+  dma_channel_configure(wm_dma_rx, &r, wm_rx, &wm_pio->rxf[wm_sm], dma_encode_endless_transfer_count(), true);
+  wm_tx_w = 3000; wm_rx_rd = 0;                       // rezerva pornește plină (liniște)
+  pio_sm_set_enabled(wm_pio, wm_sm, true);
+  return true;
+}
+
 static void audio_out_begin() {
+  // nucleul 1 face probe + init pe I2C (bus comun cu OLED-ul); se așteaptă rezultatul
+  uint32_t t0 = millis();
+  while (g_wm == 0 && millis() - t0 < 3000) delay(5);
+  if (g_wm == 1 && wm_pio_start()) return;
+  if (g_wm == 1) g_wm = -2;                           // codec găsit, dar fără PIO/DMA liber
   i2s.setBCLK(PIN_I2S_BCK);
   i2s.setDATA(PIN_I2S_DATA);
   i2s.setBitsPerSample(16);
   i2s.setBuffers(8, 256);
   i2s.begin(FS_OUT);
 }
+static void aq_put(int16_t v) { aq[aq_w] = v; aq_w = (aq_w + 1) % AQ; }
 static void audio_out_push(float x) {
+  if (g_mic_loop) return;                             // testul cu microfonul ține coada
   if (x > 1) x = 1; if (x < -1) x = -1;
   int n = (aq_w - aq_r + AQ) % AQ;
-  if (n >= AQ - UPS) { g_audio_drop++; up_prev = x; return; }   // ceasul FPGA > ceasul I2S: aruncă
-  for (int k = 1; k <= UPS; k++) {
-    float y = up_prev + (x - up_prev) * k / UPS;
-    aq[aq_w] = (int16_t)(y * 32000); aq_w = (aq_w + 1) % AQ;
-  }
+  if (n >= AQ - UPS) { g_audio_drop++; up_prev = x; return; }   // ceasul FPGA > ceasul audio: aruncă
+  for (int k = 1; k <= UPS; k++) aq_put((int16_t)((up_prev + (x - up_prev) * k / UPS) * 32000));
   up_prev = x;
 }
-static void audio_out_pump() {
-  while (aq_r != aq_w && i2s.availableForWrite() >= 4) {
-    int16_t s = aq[aq_r]; aq_r = (aq_r + 1) % AQ;
-    i2s.write16(s, s);
+// microfon: citește cadrele noi din inelul ADC (vârfuri; în testul de buclă -> coada de ieșire)
+static void audio_in_poll() {
+  uint32_t wr = wm_rx_wr(), n = 0;
+  int16_t pl = g_mic_pk_l, pr = g_mic_pk_r;
+  while (wm_rx_rd != wr) {
+    uint32_t f = wm_rx[wm_rx_rd]; wm_rx_rd = (wm_rx_rd + 1) % WM_RING_WORDS; n++;
+    int16_t l = (int16_t)(f >> 16), r = (int16_t)f;
+    if (abs(l) > pl) pl = abs(l); if (abs(r) > pr) pr = abs(r);
+    if (g_mic_loop && (aq_w - aq_r + AQ) % AQ < AQ - 1) aq_put((int16_t)(((int32_t)l + r) / 2));
+    if (g_mic_usb) usb_audio_push48k(g_mic_usb == 1 ? l : r);
   }
-  if (i2s.getUnderflow()) g_audio_under++;
+  g_mic_pk_l = pl; g_mic_pk_r = pr; g_wm_frames += n;
+}
+static void audio_out_pump() {
+  if (g_wm != 1) {
+    while (aq_r != aq_w && i2s.availableForWrite() >= 4) {
+      int16_t s = aq[aq_r]; aq_r = (aq_r + 1) % AQ;
+      i2s.write16(s, s);
+    }
+    if (i2s.getUnderflow()) g_audio_under++;
+    return;
+  }
+  audio_in_poll();
+  // inelul DAC: DMA-ul citește la nesfârșit; scriem în fața lui, ținând 3000..4000 cadre (62..83 ms) avans.
+  // Producătorul și consumatorul merg cu aceeași viteză, deci avansul stă lângă minim: minimul E rezerva.
+  // Rezerva acoperă pauzele buclei principale (salvarea setărilor în flash, comenzi); depășită -> pârâit.
+  uint32_t rd = wm_tx_rd();
+  uint32_t ahead = (wm_tx_w - rd) % WM_RING_WORDS;
+  if (ahead > WM_RING_WORDS * 3 / 4) {                // valoare de inel negativă: DMA-ul ne-a depășit, reluăm de la el
+    wm_tx_w = (rd + 3000) % WM_RING_WORDS; ahead = 3000; g_audio_under++;
+  }
+  while (ahead < 4000) {
+    if (aq_r != aq_w) {
+      uint16_t s = (uint16_t)aq[aq_r]; aq_r = (aq_r + 1) % AQ;
+      wm_last = ((uint32_t)s << 16) | s;              // mono pe ambele canale
+    } else if (ahead >= 3000) break;                   // coada goală dar avem rezervă: așteptăm
+    else g_audio_under++;                              // goliciune: se repetă ultimul cadru
+    wm_tx[wm_tx_w] = wm_last; wm_tx_w = (wm_tx_w + 1) % WM_RING_WORDS; ahead++;
+  }
+}
+
+static void wm_status() {
+  if (g_wm != 1) {
+    if (wm8960_fail_reg >= 0) Serial.printf("WM8960 init: prima scriere esuata = registrul 0x%02X (cod Wire %d, 2 = NACK adresa, 3 = NACK date)\n", wm8960_fail_reg, wm8960_fail_code);
+    Serial.printf("audio: %s\n", g_wm == -2 ? "WM8960 gasit, dar fara PIO/DMA liber -> PCM5102A" : "WM8960 nu raspunde pe I2C (0x1A) -> PCM5102A pe GP14");
+    return;
+  }
+  int16_t l = g_mic_pk_l, r = g_mic_pk_r; g_mic_pk_l = g_mic_pk_r = 0;
+  auto db = [](int v) { return v > 0 ? 20 * log10f(v / 32768.0f) : -99.0f; };
+  Serial.printf("audio: WM8960 master | cadre %lu/s | casti 0x%02X (%+d dB) | difuzor %s | mic PGA %d (%+.2f dB) boost %d | "
+                "varf mic L %.1f R %.1f dBFS | avans DAC %lu | under %lu drop %lu | bucla mic %s\n",
+                (unsigned long)g_wm_rate, g_wm_hp, g_wm_hp ? g_wm_hp - 0x79 : -99,
+                g_wm_spk ? "pornit" : "oprit", g_wm_pga, -17.25 + 0.75 * g_wm_pga, g_wm_boost,
+                (double)db(l), (double)db(r), (unsigned long)((wm_tx_w - wm_tx_rd()) % WM_RING_WORDS),
+                (unsigned long)g_audio_under, (unsigned long)g_audio_drop, g_mic_loop ? "PORNITA" : "oprita");
 }
 
 // ============================================================
@@ -560,7 +714,7 @@ static void rx_pair(int32_t i, int32_t q) {
   if (RB_Q_NEG != g_iq_inv) q = -q;                  // convenția firmware-ului: +f = USB
   float out;
   float fi = i / 8388608.0f, fq = q / 8388608.0f;
-  if (dsp_push(fi, fq, &out)) { audio_out_push(out); usb_audio_push12k(g_dsp_raw); }
+  if (dsp_push(fi, fq, &out)) { audio_out_push(out); if (!g_mic_usb) usb_audio_push12k(g_dsp_raw); }
   if (cap_req) {
     cap_i[cap_n] = fi; cap_q[cap_n] = fq;
     if (++cap_n >= FFT_N) { cap_n = 0; __dmb(); cap_req = false; cap_ready = true; }
@@ -596,7 +750,10 @@ static void radio_start() {
   gpio_init(PIN_RX_CLK); gpio_set_dir(PIN_RX_CLK, GPIO_OUT); gpio_put(PIN_RX_CLK, 0);  // jos ÎNAINTE de încărcare
   gpio_init(PIN_RX_RDY); gpio_set_dir(PIN_RX_RDY, GPIO_IN);
   for (int k = 0; k < 4; k++) { gpio_init(PIN_RX_D0 + k); gpio_set_dir(PIN_RX_D0 + k, GPIO_IN); }
-  for (uint8_t p : FREED_GP) { gpio_init(p); gpio_set_dir(p, GPIO_IN); }
+  for (uint8_t p : FREED_GP) {
+    if (g_wm == 1 && (p == PIN_I2S_DOUT || p == PIN_I2S_DIN)) continue;   // sunt ale PIO-ului audio
+    gpio_init(p); gpio_set_dir(p, GPIO_IN);
+  }
   gpio_init(PIN_FPGA_NCONFIG);  gpio_set_dir(PIN_FPGA_NCONFIG, GPIO_OUT); gpio_put(PIN_FPGA_NCONFIG, 1);
   gpio_init(PIN_FPGA_DATA0);    gpio_set_dir(PIN_FPGA_DATA0, GPIO_OUT);
   gpio_init(PIN_FPGA_DCLK);     gpio_set_dir(PIN_FPGA_DCLK, GPIO_OUT);
@@ -728,8 +885,86 @@ static void cat_cmd(const char *c) {
   // setare necunoscută: Kenwood nu răspunde nimic
 }
 
+// Comanda u: comandă FPGA-ul GP16 / GP23 (liniile eliberate, vizate pt. WM8960 DACDAT/ADCDAT)?
+// Pinul e intrare; cu pull-up apoi pull-down: dacă nivelul urmează rezistența, nu-l ține nimeni.
+// Plus comutări în 100 000 de citiri cu fluxul RX pornit (un FPGA care le comandă ar comuta sau ar sta fix).
+static void freed_pin_test() {
+  const int P[2] = { 16, 23 };
+  const char *N[2] = { "GP16 (hdr 36)", "GP23 (hdr 16)" };
+  for (int k = 0; k < 2; k++) {
+    int p = P[k];
+    gpio_set_dir(p, GPIO_IN);
+    gpio_pull_up(p);   delayMicroseconds(200); int up = gpio_get(p);
+    uint32_t tr = 0; int last = up;
+    for (int n = 0; n < 100000; n++) { int v = gpio_get(p); if (v != last) { tr++; last = v; } }
+    // erata RP2350 E9: cu intrarea activă, pull-down-ul nu coboară un pin rămas sus → descărcare cu IE oprit
+    gpio_set_input_enabled(p, false); gpio_pull_down(p); delayMicroseconds(500);
+    gpio_set_input_enabled(p, true); int dn = gpio_get(p);
+    uint32_t tr2 = 0; last = dn;
+    for (int n = 0; n < 100000; n++) { int v = gpio_get(p); if (v != last) { tr2++; last = v; } }
+    gpio_disable_pulls(p);
+    // revenire după 2 µs ținut jos (2 mA): ieșire FPGA = sus imediat; pull-up slab = sute de ns (RC cu ~10 pF)
+    gpio_set_drive_strength(p, GPIO_DRIVE_STRENGTH_2MA);
+    uint32_t loops[3];
+    for (int r = 0; r < 3; r++) {
+      uint32_t msk = 1u << p, cnt = 0;
+      uint32_t irq = save_and_disable_interrupts();
+      sio_hw->gpio_clr = msk; sio_hw->gpio_oe_set = msk;
+      busy_wait_us_32(2);
+      sio_hw->gpio_oe_clr = msk;
+      while (!(sio_hw->gpio_in & msk) && cnt < 100000) cnt++;
+      restore_interrupts(irq);
+      loops[r] = cnt;
+    }
+    Serial.printf("  %s: revenire dupa tras jos = %lu/%lu/%lu bucle (~%lu ns)\n", N[k],
+                  (unsigned long)loops[0], (unsigned long)loops[1], (unsigned long)loops[2],
+                  (unsigned long)(loops[1] * 4 * 1000000000ull / clock_get_hz(clk_sys)));
+    Serial.printf("  %s: pull-up -> %d, pull-down -> %d, comutari %lu/%lu  => %s\n", N[k], up, dn,
+                  (unsigned long)tr, (unsigned long)tr2,
+                  (up == 1 && dn == 0 && tr == 0 && tr2 == 0) ? "LIBER (nu-l comanda FPGA)" :
+                  (tr == 0 && tr2 == 0 && loops[1] >= 2) ? "pull-up slab in FPGA, nu iesire => folosibil" :
+                  "COMANDAT / suspect - NU folosi");
+  }
+}
+
 static void handle_cmd(const char *s) {
   if (s[0] == 'i') { pin_activity(); return; }
+  if (s[0] == 'u') { if (g_wm == 1) Serial.println("u: GP16/GP23 sunt ale WM8960 acum"); else freed_pin_test(); return; }
+  if (s[0] == 'a') {                                  // WM8960: a | ah<reg> | as<reg> | am<pga> | ab<boost> | al1/al0
+    long a = atol(s + 2);
+    if (g_wm == 1) switch (s[1]) {
+      case 'h': g_wm_hp_req = a; break;
+      case 's': g_wm_spk_req = a; break;
+      case 'm': g_wm_pga = constrain(a, 0, 63); g_wm_mic_req = 1; break;
+      case 'b': g_wm_boost = constrain(a, 0, 3); g_wm_mic_req = 1; break;
+      case 'l': g_mic_loop = a != 0; break;
+      case 'u': g_mic_usb = constrain(a, 0, 2); break;
+    }
+    if (s[1] == 'i') {                                // rezultatul scanării îl scrie nucleul 1
+      // nivelul liniilor, citit de aici: dacă nucleul 1 e blocat pe I2C, măcar vedem cine ține magistrala jos
+      int sda = 0, scl = 0;
+      for (int k = 0; k < 1000; k++) { sda += gpio_get(PIN_OLED_SDA); scl += gpio_get(PIN_OLED_SCL); delayMicroseconds(10); }
+      Serial.printf("I2C linii (10 ms): SDA sus %d%%, SCL sus %d%%  (normal ~100%% in repaus; 0%% = tinuta la masa)\n", sda / 10, scl / 10);
+      if (g_i2c_recover_pulses >= 0) Serial.printf("la pornire SDA era blocat: deblocat dupa %d impulsuri SCL\n", g_i2c_recover_pulses);
+      g_i2c_scan = true; return;
+    }
+    if (s[1] == 'r') {
+      if (g_wm == 1) { Serial.println("WM8960 merge deja"); return; }
+      g_wm_retry = 1; uint32_t t0 = millis();
+      while (g_wm_retry != 2 && millis() - t0 < 3000) { if (g_fpga == 1) rx_poll(); audio_out_pump(); }
+      if (g_wm_init == 1) {
+        i2s.end();                                    // PCM5102A eliberează GP4/GP5 (devin intrări de ceas)
+        g_wm = wm_pio_start() ? 1 : -2;               // ia și GP16/GP23 (pio_gpio_init)
+      }
+      g_wm_retry = 0;
+    }
+    if (s[1]) {                                       // nucleul 1 scrie pe I2C între două desene; sunetul curge mai departe
+      uint32_t t0 = millis();
+      while (millis() - t0 < 50) { if (g_fpga == 1) rx_poll(); audio_out_pump(); }
+    }
+    wm_status();
+    return;
+  }
   if (s[0] == 'z') { scan_start(s + 1); return; }
   long v = atol(s + 1);
   if (s[0] == 'f' && v >= 10000 && v <= 30000000) { g_freq = v; g_freq_dirty = true; }
@@ -841,7 +1076,7 @@ void loop() {
     }
     keep = (keep + 1) % 4;
   }
-  if (now - t_rate >= 1000) { t_rate = now; g_iq_rate = cnt_iq; cnt_iq = 0; }
+  if (now - t_rate >= 1000) { t_rate = now; g_iq_rate = cnt_iq; cnt_iq = 0; g_wm_rate = g_wm_frames; g_wm_frames = 0; }
   scan_tick();
   if (g_stream) iqb_pump();
 
@@ -923,9 +1158,18 @@ struct Settings {
   int8_t   sql; uint8_t nr; uint8_t rsv[2]; int32_t cal_ppb;    // cal_ppb: fost rezervă (0)
   uint32_t band_f[NBANDS];
   uint8_t  band_mode[NBANDS];
+  uint8_t  wm_hp, wm_spk, wm_pga, wm_boost;          // WM8960 (RBS4): registre căști/difuzor, PGA și boost microfon
   uint32_t sum;
 };
-static const uint32_t SET_MAGIC = 0x52425333;          // "RBS3"; schimbă-l când se schimbă structura
+static const uint32_t SET_MAGIC = 0x52425334;          // "RBS4"; schimbă-l când se schimbă structura
+// RBS3 = aceeași structură fără câmpurile WM8960; se citește o dată, ca să nu se piardă setările vechi
+struct SettingsV3 {
+  uint32_t magic, freq; uint8_t mode, step, vol; int8_t gain; uint8_t bw[8];
+  int8_t sql; uint8_t nr; uint8_t rsv[2]; int32_t cal_ppb;
+  uint32_t band_f[NBANDS]; uint8_t band_mode[NBANDS]; uint32_t sum;
+};
+static const uint32_t SET_MAGIC_V3 = 0x52425333;
+static volatile bool g_settings_loaded = false;       // nucleul 1 aplică setările WM8960 abia după încărcare
 static Settings set_saved;
 
 static uint32_t settings_sum(const Settings &x) {
@@ -938,6 +1182,7 @@ static void settings_snapshot(Settings &x) {
   memset(&x, 0, sizeof(x));
   x.magic = SET_MAGIC; x.freq = g_freq; x.mode = g_mode; x.step = step_idx;
   x.vol = g_vol; x.gain = g_gain_db; x.sql = g_sql; x.nr = g_nr; x.cal_ppb = g_cal_ppb;
+  x.wm_hp = g_wm_hp; x.wm_spk = g_wm_spk; x.wm_pga = g_wm_pga; x.wm_boost = g_wm_boost;
   for (int m = 0; m < MODE_N; m++) x.bw[m] = g_bw_idx[m];
   for (int b = 0; b < NBANDS; b++) { x.band_f[b] = BANDS[b].f; x.band_mode[b] = BANDS[b].mode; }
   x.sum = settings_sum(x);
@@ -946,7 +1191,22 @@ static void settings_snapshot(Settings &x) {
 static void settings_load() {
   EEPROM.begin(sizeof(Settings) < 256 ? 256 : 512);
   Settings x; EEPROM.get(0, x);
-  if (x.magic == SET_MAGIC && x.sum == settings_sum(x)) {     // altfel: prima pornire, rămân valorile implicite
+  bool ok = x.magic == SET_MAGIC && x.sum == settings_sum(x);
+  if (ok) {
+    if (x.wm_hp == 0 || (x.wm_hp >= 0x30 && x.wm_hp <= 0x7F))   g_wm_hp = x.wm_hp;
+    if (x.wm_spk == 0 || (x.wm_spk >= 0x30 && x.wm_spk <= 0x7F)) g_wm_spk = x.wm_spk;
+    if (x.wm_pga <= 63) g_wm_pga = x.wm_pga;
+    if (x.wm_boost <= 3) g_wm_boost = x.wm_boost;
+  } else {                                           // setări RBS3: aceleași câmpuri până la band_mode
+    SettingsV3 o; EEPROM.get(0, o);
+    uint32_t h = 2166136261u; const uint8_t *b = (const uint8_t *)&o;
+    for (size_t k = 0; k < offsetof(SettingsV3, sum); k++) h = (h ^ b[k]) * 16777619u;
+    if (o.magic == SET_MAGIC_V3 && o.sum == h) {
+      memcpy(&x, &o, offsetof(SettingsV3, sum));
+      ok = true;
+    }
+  }
+  if (ok) {                                          // altfel: prima pornire, rămân valorile implicite
     if (x.freq >= 10000 && x.freq <= 30000000) g_freq = x.freq;
     if (x.mode < MODE_N) g_mode = x.mode;
     if (x.step < 5) step_idx = x.step;
@@ -963,6 +1223,7 @@ static void settings_load() {
     }
   }
   settings_snapshot(set_saved);
+  g_settings_loaded = true;
 }
 
 // apelat din loop1: salvează când setările s-au schimbat și apoi au stat neatinse 5 s
@@ -979,13 +1240,70 @@ static void settings_poll() {
   set_saved = now;
 }
 
+// Deblocare I2C. Când Pico se resetează (scriere firmware) în mijlocul unei transmisii, un slave alimentat
+// în continuare (WM8960 ia 5V din header, nu se resetează) poate rămâne cu SDA ținut jos, așteptând ceasul:
+// magistrala moare, OLED-ul nu mai pornește. Se dau impulsuri pe SCL până eliberează SDA, apoi STOP.
+// (Văzut 21 oct: SDA 0%, SCL 100% după fiecare flash.)
+static void i2c_bus_recover() {
+  const uint SDA = PIN_OLED_SDA, SCL = PIN_OLED_SCL;
+  gpio_init(SDA); gpio_init(SCL);
+  gpio_pull_up(SDA); gpio_pull_up(SCL);
+  gpio_put(SDA, 0); gpio_put(SCL, 0);                // „open-drain": 0 = ieșire jos, 1 = intrare (pull-up)
+  gpio_set_dir(SDA, GPIO_IN); gpio_set_dir(SCL, GPIO_IN);
+  delayMicroseconds(10);
+  if (gpio_get(SDA)) return;
+  int n = 0;
+  while (!gpio_get(SDA) && n < 18) {
+    gpio_set_dir(SCL, GPIO_OUT); delayMicroseconds(5);
+    gpio_set_dir(SCL, GPIO_IN);  delayMicroseconds(5);
+    n++;
+  }
+  // STOP: SDA jos cu SCL sus, apoi SDA sus
+  gpio_set_dir(SDA, GPIO_OUT); delayMicroseconds(5);
+  gpio_set_dir(SDA, GPIO_IN);  delayMicroseconds(5);
+  g_i2c_recover_pulses = n;
+}
+
 void setup1() {
   pinMode(PIN_ENC_A, INPUT_PULLUP);
   pinMode(PIN_ENC_B, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), enc_isr, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), enc_isr, CHANGE);
+  i2c_bus_recover();
   Wire1.setSDA(PIN_OLED_SDA); Wire1.setSCL(PIN_OLED_SCL); Wire1.setClock(400000);
   oled.begin();
+  // WM8960 pe același I2C: nucleul 0 așteaptă rezultatul în audio_out_begin()
+  g_wm = (wm8960_probe(Wire1) && wm8960_init(Wire1)) ? 1 : -1;
+  if (g_wm == 1) {                                   // volumele și microfonul salvate în flash
+    uint32_t t0 = millis();
+    while (!g_settings_loaded && millis() - t0 < 1000) delay(1);
+    wm8960_set_hp(Wire1, g_wm_hp); wm8960_set_spk(Wire1, g_wm_spk); wm8960_set_mic(Wire1, g_wm_pga, g_wm_boost);
+  }
+}
+
+static void i2c_scan() {
+  Serial.print("I2C (GP2/GP3):");
+  int n = 0;
+  for (int a = 0x08; a < 0x78; a++) {
+    Wire1.beginTransmission(a);
+    if (Wire1.endTransmission() == 0) { Serial.printf(" 0x%02X%s", a, a == 0x1A ? "(WM8960)" : a == 0x3C ? "(OLED)" : ""); n++; }
+  }
+  Serial.println(n ? "" : " nimic");
+}
+
+// cererile de la comenzile USB („a…") se execută aici: I2C-ul e al nucleului 1 (OLED-ul e pe același bus)
+static void wm_requests() {
+  if (g_i2c_scan) { g_i2c_scan = false; i2c_scan(); }
+  if (g_wm_retry == 1) {
+    g_wm_init = (wm8960_probe(Wire1) && wm8960_init(Wire1)) ? 1 : -1;
+    if (g_wm_init == 1) { wm8960_set_hp(Wire1, g_wm_hp); wm8960_set_spk(Wire1, g_wm_spk); wm8960_set_mic(Wire1, g_wm_pga, g_wm_boost); }
+    g_wm_retry = 2;
+  }
+  if (g_wm != 1) return;
+  int v;
+  if ((v = g_wm_hp_req) >= 0)  { g_wm_hp_req = -1;  if (v < 0x30) v = 0; if (v > 0x7F) v = 0x7F; g_wm_hp = v;  wm8960_set_hp(Wire1, v); }
+  if ((v = g_wm_spk_req) >= 0) { g_wm_spk_req = -1; if (v < 0x30) v = 0; if (v > 0x7F) v = 0x7F; g_wm_spk = v; wm8960_set_spk(Wire1, v); }
+  if (g_wm_mic_req >= 0)       { g_wm_mic_req = -1; wm8960_set_mic(Wire1, g_wm_pga, g_wm_boost); }
 }
 
 // ---------------- butoane pe un singur pin (GP24 = pin 18 = DCLK, după configurarea FPGA) ----------------
@@ -1122,6 +1440,7 @@ static int draw_item(int x, int y, const char *txt, bool sel) {
 
 void loop1() {
   static uint32_t t_draw = 0, t_down = 0, t_act = 0; static bool down = false, long_done = false;
+  wm_requests();
   static bool win_done = false;
   if (!win_done) { for (int k = 0; k < FFT_N; k++) win[k] = 0.5f - 0.5f * cosf(2 * (float)M_PI * k / (FFT_N - 1)); win_done = true; }
 

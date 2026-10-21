@@ -14,7 +14,24 @@ rezolva in favoarea fisierului, dupa verificare pe placa.
 
 ---
 
-### 0.5 Header complet — RP2350-PiZero + Radioberry înfipt + firmware `rx_audio` (gateware 73.3)  ← CABLAJUL ACTUAL
+### 0.7 WM8960 Audio HAT (21 oct 2026)  ← CABLAJUL ACTUAL pentru audio
+
+Față de §0.5 se schimbă doar audio-ul (PCM5102A scos). HAT-ul se leagă cu fire, **nu** înfipt:
+
+| HAT pin | Semnal | PiZero pin | GP |
+|---|---|---|---|
+| 2 | 5V | 2 | — |
+| 6 | GND | 6 | — |
+| 3 | SDA | 3 (comun cu OLED) | 2 |
+| 5 | SCL | 5 (comun cu OLED) | 3 |
+| 12 | BCLK (ieșire codec) | 8 | 4 |
+| 35 | LRCLK (ieșire codec) | 10 | 5 |
+| 40 | DACDAT | 36 | 16 |
+| 38 | ADCDAT | 16 | 23 |
+
+Pinul 7 (GP14, fost PCM5102A DIN) rămâne liber, rezervat TX. Detalii și capcane: PINI_SI_FIRMWARE.md §7.
+
+### 0.5 Header complet — RP2350-PiZero + Radioberry înfipt + firmware `rx_audio` (gateware 73.3)  ← audio depășit de §0.7
 
 Sursa: netlist-ul Radioberry (`hardware/radio/Radioberry.net`, CN302 ↔ FPGA U1) + schema Waveshare.
 **„Radioberry"** = pinul e folosit de placa radio, nu lega nimic acolo. **„NU LEGA"** = ieșire a FPGA-ului.
