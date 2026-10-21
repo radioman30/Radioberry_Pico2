@@ -162,6 +162,10 @@ Setările (căști, difuzor, PGA, boost) se salvează în flash (magic RBS4; set
 - **SDA blocat după fiecare flash:** Pico se resetează, HAT-ul (5V din header) nu; WM8960 rămâne ținând SDA jos
   → I2C mort, OLED stins. Rezolvat cu `i2c_bus_recover()` la pornire (impulsuri SCL + STOP).
 - Pinii I2S ai HAT-ului legați pin-la-pin (ca la un HAT înfipt) cad pe D0–D3 ale Radioberry → IQ stricat.
+- **22 oct — I2C instabil intermitent** (SDA ținut la masă de un cip extern, display înghețat, scrieri WM8960 pierdute,
+  apărea și dispărea singur; inclusiv cu firmware-ul care mergea pe 21 oct ⇒ hardware). **Rezolvat de user cu un al doilea
+  fir de GND între HAT și PiZero + rezistențe pull-up pe SCL/SDA.** Verificat: 16/16 scanări curate, inclusiv după repornire.
+  Comanda `o` = model de test pe OLED 15 s (chenar + rândurile 0/2/4/59/61/63).
 - Microfonul cu boost +29 dB + PGA +12 dB prinde tot din cameră (fond −26…−33 dBFS); pentru voce: boost +13 dB.
 - Comenzile care blocau bucla principală 50 ms dădeau pârâit (rezervă DAC 16 ms) → acum rezervă 62 ms și
   așteptări care pompează audio în continuare.
