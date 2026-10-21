@@ -42,6 +42,13 @@ Adafruit TinyUSB, U8g2. Toate rămân ale autorilor lor, sub licențele lor.
 
 ## FUNCȚII
 
+**Emisie** (testată pe sarcină de 50 Ω, modulație verificată pe alt receptor)
+- **SSB (USB/LSB)** din microfoanele WM8960: filtru complex 300–2700 Hz la 12 kHz, limitator; **AM**; **TUNE** (ton +1 kHz); CW = ton 700 Hz
+- 1,5 – 30 MHz; eșantioane IQ 48 kHz spre FPGA prin PIO + DMA (TX_RDY / ceas / date), MOX pe toate comenzile SPI
+- **PTT**: buton pe rețeaua RC (4,7 kΩ), CAT (`TX;` / `RX;`), comenzi USB; BOOT opțional (`tb1`)
+- **DRIVE** 0–15 și **MIC** (câștigul analogic al codecului) în meniu, salvate în flash
+- În emisie difuzorul tace; „TX” / „TUNE” sus în dreapta pe OLED
+
 **Recepție**
 - 10 kHz – 30 MHz, IQ 48 kHz de la FPGA, DSP la 12 kHz pe RP2350
 - Moduri: **USB, LSB, CW, AM, FM** (bandă îngustă), **SAM** (AM sincron cu PLL pe purtătoare)
@@ -118,7 +125,7 @@ Numerele GP de mai jos sunt GPIO-uri RP2350 — pe PiZero **nu** coincid mereu c
 | 10 | GP5 | I2S LRCLK (intrare, de la codec) | HAT pin 35 |
 | 16 | GP23 | ADCDAT (microfon) | HAT pin 38 |
 | 36 | GP16 | DACDAT (difuzor/căști) | HAT pin 40 |
-| 18 | GP24 | rețeaua de butoane (RC) | encoder SW, MOD, BANDA — vezi mai jos |
+| 18 | GP24 | rețeaua de butoane (RC) | encoder SW, MOD (1k), BANDA (2k2), **PTT (4k7)** — vezi mai jos |
 | 27 | GP0 | encoder A | encoder CLK |
 | 28 | GP1 | encoder B | encoder DT |
 | GND | — | masă | HAT pin 6, OLED, encoder, butoane |
@@ -210,7 +217,13 @@ pe placă filtru 2,7 kHz.
 | `am<0-63>` / `ab<0-3>` | PGA microfon (−17,25 + 0,75·n dB) / boost (0, 13, 20, 29 dB) — se salvează |
 | `al1` / `al0` | test: microfoanele în difuzoare/căști în locul radioului |
 | `au1` / `au2` / `au0` | test: microfonul stâng / drept pe microfonul USB în locul radioului |
-| `ai` / `ar` | scanare I2C + nivelul liniilor / repornește WM8960 fără restart |
+| `ai` / `ar` / `aR` | scanare I2C + nivelul liniilor / pornește WM8960 / reinițializare completă |
+| `t` | stare emisie |
+| `t1` / `t0` | PTT pornit / oprit (oprește și TUNE, CAT) |
+| `tt` | TUNE: ton +1 kHz (USB) / −1 kHz (LSB) |
+| `td<0-15>` / `tg<dB>` | drive / câștig digital al microfonului la emisie |
+| `tq` / `tb1` | inversează orientarea Q la emisie / BOOT ca PTT |
+| `o` | model de test pe OLED (15 s) |
 
 ---
 
@@ -233,8 +246,8 @@ pe placă filtru 2,7 kHz.
 
 ## ÎN LUCRU
 
-- **TX** (SSB / CW / AM / FM), primul test pe sarcină artificială 50 Ω
-- Butoane FILTRU și PAS pe aceeași rețea RC (pregătite în firmware)
+- Emisie FM; CW cu manipulator; audio de emisie de la PC (difuzor USB) pentru FT8
+- Microfon extern
 
 ---
 
