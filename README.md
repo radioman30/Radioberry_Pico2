@@ -7,7 +7,7 @@
 *WM8960 Audio HAT sus (legat cu fire), Radioberry v2 cu ventilator pe RP2350-PiZero, difuzorul HAT-ului și
 panoul cu OLED și encoder în carcasă printată 3D — recepție LSB pe 3,677 MHz (80 m).*
 
-▶ **[Video, 27 s — recepție LSB pe 40 m, cu sunet](docs/receptor.mp4)**
+▶ **[Video, 20 s — recepție LSB pe 40 m (7,193 MHz), cu sunet din difuzorul WM8960](docs/receptor.mp4)**
 
 Radioberry_Pico2 este un receptor HF experimental construit în jurul plăcii **Radioberry v2 (CL025)**
 înfipte direct într-un **Waveshare RP2350-PiZero**.
@@ -102,7 +102,7 @@ Adafruit TinyUSB, U8g2. Toate rămân ale autorilor lor, sub licențele lor.
 | Radio | **Radioberry v2, Cyclone 10 LP 10CL025** + AD9866 (doar CL025 testat) |
 | Audio | **Waveshare WM8960 Audio HAT** (legat cu fire, nu înfipt) — sau, ca rezervă, modul PCM5102A |
 | Afișaj | OLED 1,3" 128×64, I2C |
-| Comenzi | encoder rotativ cu buton + butoanele MOD și BANDA |
+| Comenzi | encoder rotativ cu buton + butoanele MOD, BANDA și PTT |
 | Alimentare | 5 V / 2 A extern |
 
 Radioberry se înfige direct în header-ul de 40 de pini al PiZero; restul se leagă cu fire.
@@ -158,13 +158,17 @@ Header-ul nu are pin analogic liber, așa că butoanele se recunosc după timpul
 condensator prin rezistența fiecăruia:
 
 ```
- pin 18 (GP24) ──[ 470 Ω ]──┬──────────┬──────────┬──────────┐
-                            │          │          │          │
-                       tantal 1 µF  encoder SW    MOD       BANDA
-                       (+ spre nod)    │          │          │
-                            │          │       [1 kΩ]    [2,2 kΩ]
- GND ───────────────────────┴──────────┴──────────┴──────────┘
+ pin 18 (GP24) ──[ 470 Ω ]──┬──────────┬──────────┬──────────┬──────────┐
+                            │          │          │          │          │
+                       tantal 1 µF  encoder SW    MOD       BANDA      PTT (TX)
+                       (+ spre nod)    │          │          │          │
+                            │          │       [1 kΩ]    [2,2 kΩ]   [4,7 kΩ]
+ GND ───────────────────────┴──────────┴──────────┴──────────┴──────────┘
 ```
+
+PTT-ul emite cât e ținut apăsat. PTT-ul unui microfon de mână se leagă în paralel cu butonul PTT
+(contactul lui în locul butonului, tot prin 4,7 kΩ). Măsurat pe banc: PTT 20–26 ms (încetinit de un
+pull-up de ~10 kΩ rămas pe nod) — firmware-ul tratează ca PTT orice timp între 5 și 40 ms.
 
 Rezistorul de 470 Ω e obligatoriu (izolează condensatorul de DCLK cât se încarcă FPGA-ul).
 Nu ține niciun buton apăsat la pornire.
@@ -181,8 +185,9 @@ Nu ține niciun buton apăsat la pornire.
 | MOD | USB → LSB → CW → AM → FM → SAM |
 | BANDA scurt | banda următoare |
 | BANDA lung | banda anterioară |
+| **PTT** (ținut) | **emisie** (microfon în USB/LSB/AM, ton în CW); „TX” pe OLED |
 
-**Meniul encoderului:** FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN → SQL → NR → CAL
+**Meniul encoderului:** FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN → SQL → NR → CAL → **DRIVE → MIC → MIC SRC**
 
 ---
 

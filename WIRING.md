@@ -99,7 +99,7 @@ Totul stă pe firul existent al encoderului SW.
 ```
  pin 18 (GP24) ──[ 470 Ω ]──┬──────────┬──────────┬──────────┬──────────┬──────────┐
                             │          │          │          │          │          │
-                          1 µF     encoder SW    MOD       BANDA     FILTRU      PAS
+                          1 µF     encoder SW    MOD       BANDA    PTT (TX)     PAS
                             │          │          │          │          │          │
                             │          │       [1 kΩ]   [2,2 kΩ]   [4,7 kΩ]   [10 kΩ]
                             │          │          │          │          │          │
@@ -113,8 +113,8 @@ Totul stă pe firul existent al encoderului SW.
 | encoder SW | direct, fără rezistor | firul SW se mută de pe pinul 18 pe nod (după 470 Ω) |
 | MOD | 1 kΩ | modul următor (USB → LSB → CW → AM) |
 | BANDA | 2,2 kΩ | scurt = banda următoare, lung (>0,7 s) = banda anterioară |
-| FILTRU | 4,7 kΩ | lățimea următoare a filtrului pentru modul curent |
-| PAS | 10 kΩ | pasul următor (10 Hz … 100 kHz) |
+| **PTT (TX)** | 4,7 kΩ | emisie cât e ținut apăsat (22 oct; fost FILTRU — filtrul rămâne în meniu) |
+| (PAS) | 10 kΩ | nefolosit: firmware-ul tratează acum toți timpii de 5–40 ms ca PTT |
 
 Rezistoare de 1 % dacă ai; de 5 % merg. Un singur buton apăsat odată.
 
@@ -129,7 +129,7 @@ un SW legat direct la GND. Nu ține niciun buton apăsat la pornire.
 
 **Verificare:** comanda USB `k` afișează modul detectat și timpul măsurat la ultima apăsare. Ferestrele
 (calculate pentru un prag de 1,0–1,6 V): SW < 0,1 ms · MOD 0,34–0,81 ms · BANDA 1,2–2,2 ms ·
-FILTRU 3,0–5,2 ms · PAS 6,8–11,5 ms. Dacă un buton e recunoscut greșit, trimite-mi timpii din `k`
+PTT 5–40 ms (măsurat 20–26 ms, cu pull-up-ul rămas pe nod). Dacă un buton e recunoscut greșit, trimite-mi timpii din `k`
 și ajustez limitele (`KEY_LIM_US` în `rx_audio.ino`).
 
 ---

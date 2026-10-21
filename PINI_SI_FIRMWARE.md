@@ -89,8 +89,8 @@ condensator prin rezistența fiecăruia.
 | encoder SW | direct | meniu: parametrul următor; lung = înapoi la FRECV | 0 µs |
 | MOD | 1 kΩ | USB → LSB → CW → AM → FM | 600–860 µs |
 | BANDA | 2,2 kΩ | scurt = banda următoare, lung = banda anterioară | 2275–3050 µs |
-| (FILTRU) | 4,7 kΩ | rezervat, nemontat | — |
-| (PAS) | 10 kΩ | rezervat, nemontat — cere scos și pull-up-ul encoderului | — |
+| **PTT (TX)** | 4,7 kΩ | emisie cât e ținut apăsat | 20–26 ms (fereastra PTT: 5–40 ms) |
+| (PAS) | 10 kΩ | nefolosit (fereastra lui e acum PTT) | — |
 
 - **470 Ω e obligatoriu**: izolează condensatorul de DCLK la încărcarea FPGA-ului.
 - **Modulele de butoane cu pull-up de 10 kΩ** (rezistor spre „+”): rezistorul se scoate sau „+” rămâne nelegat.
@@ -124,7 +124,7 @@ condensator prin rezistența fiecăruia.
   Pe ecran „Q” jos-dreapta, inversat când e închis.
 - **Reducere de zgomot** (meniu NR, oprit / 1 / 2 / 3), pe ecran „N”. Simulat: +9 dB (NR1) … +14,5 dB (NR3) SNR.
 - **SAM:** PLL pe purtătoare (prinde ±300 Hz în ~20 ms); la fading distorsiunea scade de la -12 dB la -32 dB (simulat).
-- Meniul encoderului: FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN → **SQL → NR → CAL**.
+- Meniul encoderului: FRECV → PAS → MOD → FILTRU → BANDA → VOL → GAIN → **SQL → NR → CAL → DRIVE → MIC → MIC SRC**.
 - **Filtre:** SSB 1,8 / 2,0 / 2,5 / 2,7 kHz · CW 250 / 500 / 1000 Hz · AM 6 / 8 kHz · FM 8 / 11 kHz.
 - **Benzi** (cu memorie): 160, 80, 60, 49 (AM), 40, 41 (AM), 31 (AM), 30, 20, 17, 15, 12, **CB** (FM), 10 m.
 - **Ecran:** frecvență, bandă, mod, S-metru, spectru ±24 kHz, waterfall, meniu jos (pas, volum, câștig, filtru).
