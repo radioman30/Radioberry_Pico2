@@ -123,7 +123,7 @@ static volatile int      g_wm_init = 0;
 static volatile bool     g_i2c_scan = false;        // ai: scanare I2C pe nucleul 1
 // 100 kHz, nu 400: cu OLED + WM8960 HAT pe fire (două seturi de pull-up), la 400 kHz transmisiile cădeau
 // la întâmplare (timeout la registre WM8960, SDA blocat) — 22 oct.
-#define I2C_HZ 100000
+#define I2C_HZ 400000   // înapoi la 400 kHz după reparația GND/pull-up (100 kHz făcea UI-ul lent: ~90 ms/cadru)
 static volatile uint32_t g_i2c_fixes = 0;
 static volatile uint32_t g_core1_beat = 0;         // crește la fiecare trecere prin loop1 (nucleul 1 trăiește?)
 static volatile bool     g_wm_stop_req = false;    // aX: resetează codecul (oprește BCLK/LRCLK) — test de diafonie
@@ -821,11 +821,16 @@ static volatile float g_tx_probe_pos = -200, g_tx_probe_neg = -200;   // RX în 
 static uint16_t tx_prog_instr[9];
 static PIO  tx_pio; static uint tx_sm; static int tx_off = -1, tx_dma = -1;
 static pio_sm_config tx_cfg;
+// 32 KB = MAXIMUL inelului DMA (câmpul RING_SIZE are 4 biți: 2^15). Cu 16, inelul se dezactiva, DMA-ul citea liniar
+// până la capătul RAM-ului și se oprea după 0,4-2 s (22 oct: FPGA-ul a primit gunoi, apoi 0 eșantioane/s).
 #define TX_RING_BITS  15                             // 32 KB = 8192 eșantioane = 170 ms
 #define TX_RING_WORDS (1u << (TX_RING_BITS - 2))
+static_assert(TX_RING_BITS <= 15 && WM_RING_BITS <= 15 && RX_RING_BITS <= 15, "inelul DMA are maxim 2^15 octeti");
 static uint32_t tx_ring[TX_RING_WORDS] __attribute__((aligned(1u << TX_RING_BITS)));
 static uint32_t tx_w = 0;
-static const uint32_t TX_LEAD_MIN = 1024, TX_LEAD = 2048, TX_LEAD_MAX = 6000;
+// La pornire FPGA-ul își umple FIFO-ul TX dintr-o dată (mai repede de 48 kHz): cu 2048 de rezervă se goleau
+// 1100-2100 eșantioane la fiecare apăsare (22 oct) -> se pornește cu 8192 (170 ms de liniște, apoi microfonul).
+static const uint32_t TX_LEAD_MIN = 1024, TX_LEAD = 5000, TX_LEAD_MAX = 6000;
 
 static uint32_t tx_rd() { return ((uint32_t)dma_hw->ch[tx_dma].read_addr - (uint32_t)tx_ring) / 4 % TX_RING_WORDS; }
 
@@ -1045,7 +1050,7 @@ static void tx_poll() {
   cnt += (rd - last_rd) % TX_RING_WORDS; last_rd = rd;
   if (millis() - t_rate >= 1000) { t_rate = millis(); g_tx_rate = cnt; cnt = 0; }
   uint32_t ahead = (tx_w - rd) % TX_RING_WORDS;
-  if (ahead > TX_RING_WORDS * 3 / 4) { tx_w = (rd + TX_LEAD) % TX_RING_WORDS; ahead = TX_LEAD; g_tx_under++; }   // DMA-ul ne-a depășit
+  if (ahead > TX_RING_WORDS - 512) { tx_w = (rd + TX_LEAD) % TX_RING_WORDS; ahead = TX_LEAD; g_tx_under++; }   // DMA-ul ne-a depășit
   if (g_tx_src == TXS_TONE) {                        // tonul se generează aici, cât e loc
     static float ph = 0;
     float w = 2 * (float)M_PI * g_tx_tone_hz / 48000.0f * (g_mode == MODE_LSB ? -1 : 1);
