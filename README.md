@@ -1,11 +1,11 @@
 # Radioberry_Pico2
 
-**Receptor SDR HF standalone: Radioberry v2 + RP2350, fără Linux, fără PC.**
+**SDR HF standalone (recepție + emisie SSB): Radioberry v2 + RP2350, fără Linux, fără PC.**
 
-![Radioberry_Pico2 — LSB pe 80 m, spectru și waterfall pe OLED, panou în carcasă printată](docs/receptor.jpg)
+![Radioberry_Pico2 — WM8960 Audio HAT, Radioberry v2 pe RP2350-PiZero, panou cu OLED, LSB pe 80 m](docs/receptor.jpg)
 
-*Radioberry v2 (cu ventilator) pe RP2350-PiZero, PCM5102A în dreapta, panoul cu OLED și encoder în
-carcasă printată 3D — recepție LSB pe 3,674 MHz.*
+*WM8960 Audio HAT sus (legat cu fire), Radioberry v2 cu ventilator pe RP2350-PiZero, difuzorul HAT-ului și
+panoul cu OLED și encoder în carcasă printată 3D — recepție LSB pe 3,677 MHz (80 m).*
 
 ▶ **[Video, 27 s — recepție LSB pe 40 m, cu sunet](docs/receptor.mp4)**
 
