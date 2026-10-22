@@ -241,6 +241,11 @@ pe placă filtru 2,7 kHz.
 [**Releases**](https://github.com/radioman30/Radioberry_Pico2/releases) (include gateware-ul FPGA),
 ține **BOOT** apăsat, conectează USB, copiază `.uf2` pe discul **RP2350** care apare. Placa repornește singură.
 
+| Release | Placă de sunet | Ce face |
+|---|---|---|
+| [**v2.0**](https://github.com/radioman30/Radioberry_Pico2/releases/tag/v2.0) | **WM8960 Audio HAT** | recepție + emisie (TUNE, SSB/AM din microfon, PTT) |
+| [**v1.0**](https://github.com/radioman30/Radioberry_Pico2/releases/tag/v1.0) | **PCM5102A** (doar căști) | numai recepție — cablaj: [`WIRING.md` de la v1.0](https://github.com/radioman30/Radioberry_Pico2/blob/v1.0/WIRING.md) |
+
 **Din sursă:**
 1. **Gateware** (binar terț, nu e în repo): `radioberry.rbf` PIO 75.2 din
    [RagchewBerry](https://github.com/wp3dn/RagchewBerry) (`components/gateware/bitstreams/CL025/`),
