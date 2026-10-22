@@ -22,7 +22,10 @@ antena și căștile și merge ca receptor de sine stătător. Legat la PC pe US
 HDSDR.
 
 **Stare (5 oct 2026): recepția funcționează**, testată pe aer — AM pe 31/41 m, SSB pe 40 m, FT8
-decodat în WSJT-X pe 60 m și 40 m prin microfonul USB al plăcii. Emisia (TX) nu e implementată încă.
+decodat în WSJT-X pe 60 m și 40 m prin microfonul USB al plăcii.
+
+**22 oct 2026: emisia funcționează** — TUNE și SSB/AM din microfonul WM8960, cu PTT pe buton, BOOT sau
+CAT; testată pe sarcină de 50 Ω, modulația verificată pe alt receptor.
 
 ---
 
